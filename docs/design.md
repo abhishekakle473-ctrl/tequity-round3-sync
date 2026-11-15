@@ -228,12 +228,99 @@ record again under a different actor, and that change is genuine.
 comparison. The loop protection still holds; the cost is throughput on the
 inbound path.
 
-### 1.3 Still open
+### 1.3 What the inbound path assumes
+
+**A7. A webhook carries only the fields that changed, and every payload is
+normalised into a list of field changes.**
+
+The brief gives one sample webhook carrying a `changedFields` object with a
+single key, and asks for a pick between that shape and the whole record. The
+sample is the only evidence, so the design assumes changed fields only.
+
+The shape then stops mattering downstream. The inbound path turns every webhook
+into a list of field changes, each carrying field name, new value, time and
+actor:
+
+- A changed-fields payload already is that list.
+- A full-record payload becomes that list by comparing against the shadow copy
+  of last-seen Salesforce values, kept anyway for echo detection under A6.
+
+The merge rule, the ordering rule and the loop rule operate on that list and
+never see the payload shape.
+
+Null handling, stated because the two shapes disagree about it:
+
+- A field **absent** from the payload means unchanged.
+- A field **present with a null value** means cleared.
+
+A webhook the endpoint cannot interpret is parked in a table for a person to
+look at, and counted. Parking means accepting: the endpoint answers with a
+success response, because an error invites Salesforce to redeliver a payload we
+will never be able to read. A payload that fails its authentication check is a
+different case and is refused outright. The parked count is a candidate for the
+three numbers the brief asks us to watch.
+
+*If wrong:* if webhooks carry the whole record, the adapter does the comparison
+and nothing downstream changes. The null rule is what breaks: under full-record
+semantics a null means empty, and a field never sent becomes
+indistinguishable from one deliberately cleared. The endpoint would then need
+the payload to declare its own shape.
+
+**A8. The catch-up query runs every minute, all the time, not only after an
+outage.**
+
+With changed-fields-only webhooks, a single webhook lost to a network failure or
+a deployment carries one field change that nothing later re-asserts. The record
+stays wrong until somebody edits that same field again.
+
+So the SystemModstamp query from A3 runs on a schedule, proposed at once per
+minute. The same mechanism covers an ordinary lost webhook and a 6-hour outage;
+after an outage it has a much wider window to cover.
+
+```
+Salesforce peak edit rate      = 30/sec = 1,800 records per minute
+one query page holds           = 2,000 records
+a 1-minute window needs        = 1 page per object type
+objects polled                 = Contact and Account
+cost per poll                  = 2 calls
+cost per minute                = 2 calls out of 4,800 = 0.04% of budget
+cost per day                   = about 2,880 calls
+```
+
+The cost is the floor of one call per object per poll, not the volume of changed
+records, so polling more often is close to free. One minute is chosen for the
+repair time it gives a lost webhook, not for the price.
+
+Field history is fetched only for records where the polled values differ from
+the shadow copy and no webhook explains the difference. On an ordinary day that
+set is close to empty, so the steady-state history cost is near zero.
+
+Two mechanics the schedule needs:
+
+- The watermark, the timestamp the next poll starts from, is stored in Postgres
+  and advanced only after the polled changes are applied, so a crash repeats a
+  window instead of skipping one.
+- Each poll overlaps the previous window and stops slightly short of the present
+  moment, so a record committed moments ago is not missed. Repeated records are
+  discarded by the same value comparison used for loop detection.
+
+**Assumption:** Salesforce makes a change visible to a SystemModstamp query
+some short time after it commits. No documentation was found stating that lag,
+so the overlap is a guess and should be generous.
+
+The 30-second visibility target is met by webhooks. The poll is a safety net
+with a looser bound: a lost webhook is repaired within about two poll intervals,
+so roughly two minutes.
+
+*If wrong:* if the visibility lag exceeds the overlap, the poll misses changes
+silently, which is the worst failure mode in this design, and the fix is a wider
+overlap at no extra call cost.
+
+### 1.4 Still open
 
 The following are silent in the brief and have no working assumption yet. Each
 is tracked in `docs/decisions.md` with the reason it matters.
 
-- Whether a webhook carries only the changed fields or the whole record.
 - What decides order on a portal save, given that the sample carries no time
   field.
 - How a portal-created record is identified before Salesforce assigns it an ID.
