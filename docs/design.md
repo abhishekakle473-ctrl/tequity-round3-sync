@@ -24,46 +24,97 @@ P1 in the decision log.
 
 **A1. The edit rate is stated separately for each side.**
 
-Not yet set. Pending.
-
 The brief leaves the peak edit rate open and asks for the number to be stated
 and used in the arithmetic. One blended number would be wrong here, because the
 brief's rate limit counts only the calls we make to Salesforce. Webhooks arriving
 at our endpoint consume none of it.
 
-So the design carries two numbers:
+Portal side, about 200 finance and customer-success users:
 
-- Portal-side edits per second, at peak and in a quiet hour. Every one of these
-  becomes a call to Salesforce, so this number drives the outbound queue and the
-  outage drain arithmetic.
-- Salesforce-side edits per second, at peak and in a quiet hour. These drive
-  inbound processing and our database write throughput, and consume none of the
-  rate budget.
+| Measure | Rate | Where it comes from |
+|---|---|---|
+| Peak | 10 per second | 200 users x 2 saves per minute at month end = 6.67 per second, rounded up for margin |
+| Busiest sustained 6 hours | 5 per second | The window used to size an outage backlog |
+| Quiet hour | 0.5 per second | |
 
-*If wrong:* a portal-side peak approaching 100 edits per second leaves no
-headroom under the cap, and the design has to batch writes or shed load during
-catch-up.
+Salesforce side, a larger sales team plus automation:
 
-**A2. The outage backlog is sized on a busy-hour average, not on peak.**
+| Measure | Rate | Where it comes from |
+|---|---|---|
+| Peak | 30 per second | Stated figure |
+| Busiest sustained 6 hours | 15 per second | Derived by applying the portal side's 2:1 peak-to-average ratio. Used only for the catch-up query cost. |
 
-Not yet set. Pending.
+Every portal-side edit becomes a call to Salesforce, so that number drives the
+outbound queue and the outage drain. Salesforce-side edits drive inbound
+processing and database write throughput, and consume none of the rate budget.
+
+Operating point: we run at **80 requests per second** against the cap of 100,
+holding **20 per second** for retries and catch-up queries.
+
+These figures are deliberately conservative. A peak of 6.67 per second against
+a 6-hour average of 5 per second is a ratio of 1.33, which describes near-peak
+load held flat for six hours, and month-end traffic is usually spikier. The
+flat profile makes the backlog larger and the drain longer, so the conservatism
+runs in the safe direction.
+
+*If wrong:* a higher portal peak shrinks drain headroom faster than it grows
+the backlog, because the live rate subtracted from the cap rises while the cap
+stays fixed. At a portal peak of 40 per second the drain rate halves and the
+26-minute figure below becomes about 54 minutes on the same backlog.
+
+**A2. The outage backlog is sized on the busiest sustained 6 hours, and the
+drain competes with live traffic.**
 
 Peak applies to the 30-second visibility target, which is a latency requirement
 under instantaneous load. The 6-hour backlog is a volume problem, so it is sized
-on a sustained rate over the window.
+on a sustained rate over the busiest such window, not on peak and not on a daily
+average.
 
-Two refinements apply to that sustained rate, and both are recorded in the
-decision log:
+Three things shape the calculation:
 
-- Edits to the same record merge into one call, so the backlog is the number of
-  distinct records with pending changes, not the number of edits. The ratio
-  between those two numbers over 6 hours is itself an assumption.
-- The drain does not have the full cap to itself. New portal edits keep arriving
-  while the backlog clears, so the rate available for draining is the cap minus
-  the live outbound rate at that moment.
+- Pending edits to one record merge into one call, so the backlog counts
+  distinct records. The merge ratio is set to **1**, which makes the result an
+  upper bound; merging can only improve it.
+- The drain does not have the full cap to itself. Portal edits keep arriving
+  while the backlog clears, so the available rate is 80 minus the live rate,
+  and the live rate used is the portal peak of 10 per second, because recovery
+  at month end competes with month-end traffic.
+- Catch-up queries run on top and come out of the 20 per second reserve.
 
-*If wrong:* if the outage covers a peak period, the backlog is larger than a
-plain average suggests, and the drain time in the design is optimistic.
+```
+6 hours                     = 21,600 seconds
+backlog  = 5/sec x 21,600   = 108,000 records
+drain rate = 80 - 10 live   = 70 requests/sec
+drain time = 108,000 / 70   = 1,543 seconds = about 26 minutes
+
+Salesforce records changed  = 15/sec x 21,600 = 324,000
+query calls at 2,000/page   = 324,000 / 2,000 = 162 calls
+history rows at 1.5/record  = 486,000 / 2,000 = 243 calls
+catch-up total              = about 405 calls = about 20 seconds
+```
+
+The 26 minutes holds only under three conditions, each of which becomes a
+requirement on the recovery path:
+
+1. **Catch-up runs before the outbound drain.** Draining first means every
+   record touched on both sides during the outage fails its conditional update
+   with a 412, costing three calls where one was budgeted. The independent
+   overlap estimate is about 7,000 records, adding roughly 3.5 minutes, and
+   records edited by both teams are correlated so the true figure is higher.
+   Catch-up costs 20 seconds and removes most of that penalty.
+2. **Changes applied by catch-up never enter the outbound queue.** They are
+   Salesforce-originated. Missing this turns a 108,000-record drain into
+   432,000 records, which is 103 minutes.
+3. **The outbound worker runs calls concurrently.** 70 per second at a 200ms
+   round trip means 14 requests in flight, and 35 at 500ms. A sequential loop
+   reaches about 5 per second and the drain takes 6 hours.
+
+The 26 minutes is a floor measured with no throttling. The brief says that when
+Salesforce tells us to slow down we slow down and keep the work, which extends
+the drain by an amount that cannot be predicted here.
+
+*If wrong:* if the outage covers a period busier than the assumed window, the
+backlog is larger than this and the drain time grows in proportion.
 
 ### 1.2 What Salesforce gives us
 

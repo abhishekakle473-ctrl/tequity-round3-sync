@@ -341,6 +341,126 @@ in Postgres for the duration of the call.
 
 ---
 
+## D7. The edit rates, and a 6-hour outage drains in about 26 minutes
+
+**Status:** agreed
+
+**Raised by:** Abhishek, who supplied the load figures and the drain
+calculation. The AI checked the arithmetic and added the catch-up query cost
+and the sequencing constraint.
+
+**Problem:** The brief leaves the peak edit rate open, asks for it to be stated
+and used in the arithmetic, and asks how long the backlog takes to drain after
+a 6-hour Salesforce outage, with the division shown.
+
+**Options, and why they lost:**
+
+- **Size the backlog on peak load for all 6 hours.** Rejected: peak is a
+  latency condition for the 30-second target, and multiplying it across 6 hours
+  describes a day nobody has. It would produce a drain time no reader believes.
+- **Size the backlog on a plain daily average.** Rejected: it understates a
+  month-end outage, which is the case that matters.
+- **Assume merging reduces the record count.** Rejected deliberately. A merge
+  ratio above 1 would shorten the drain on an optimistic assumption. Setting it
+  at 1 makes the result an upper bound, and merging only improves it.
+
+**Decision:** The figures below, and the drain arithmetic that follows.
+
+Portal side, about 200 finance and customer-success users:
+
+- Peak: each user saves roughly 2 forms per minute at month end.
+  200 x 2 = 400 per minute = 6.67 per second. Rounded up to **10 per second**,
+  a 1.5x margin.
+- Quiet hour: **0.5 per second**.
+- Busiest sustained 6 hours: **5 per second**.
+
+Salesforce side, a larger sales team plus automation:
+
+- Peak: **30 per second**.
+- Busiest sustained 6 hours: **15 per second**, derived by applying the portal
+  side's 2:1 peak-to-average ratio. This figure was not supplied directly and
+  is the AI's working assumption, used only for the catch-up query cost.
+
+Operating point:
+
+- We run at **80 requests per second** against the Salesforce cap of 100,
+  holding **20 per second** in reserve for retries and catch-up queries.
+- Merge ratio: **1**. Pending edits to one record collapse into one call per
+  D4, and the arithmetic assumes no benefit from it.
+
+Outage drain, with the division shown:
+
+```
+6 hours                     = 21,600 seconds
+backlog  = 5/sec x 21,600   = 108,000 records
+drain rate = 80 - 10 live   = 70 requests/sec
+drain time = 108,000 / 70   = 1,543 seconds = about 26 minutes
+```
+
+The live rate subtracted is the portal peak of 10 per second, not the 6-hour
+average, because recovery at month end competes with month-end traffic.
+
+Catch-up query cost, which runs on top:
+
+```
+Salesforce records changed  = 15/sec x 21,600 = 324,000
+query calls at 2,000/page   = 324,000 / 2,000 = 162 calls
+history rows at 1.5/record  = 486,000 / 2,000 = 243 calls
+total                       = about 405 calls
+at the 20/sec reserve       = about 20 seconds
+```
+
+Three conditions attach to the 26 minutes, and the design has to honour all
+three:
+
+1. **Catch-up runs before the outbound drain.** Otherwise every record touched
+   on both sides during the outage fails the If-Unmodified-Since precondition
+   with a 412, costing a re-read, a merge and a re-write where one call was
+   budgeted. Treating the two edit streams as independent gives an overlap of
+   roughly 108,000 x 324,000 / 5,000,000 = about 7,000 records, which adds
+   about 14,000 calls and 3.5 minutes. Records edited by both teams are
+   correlated, so the true overlap is higher. Catch-up costs 20 seconds and
+   removes most of the penalty.
+2. **Changes applied by catch-up must never enter the outbound queue.** They
+   are Salesforce-originated and marking them so is the same rule as D5,
+   reached by a different path. Missing it turns the drain from 108,000 records
+   into 432,000, which is 103 minutes.
+3. **70 requests per second is a concurrency requirement.** At a 200ms round
+   trip it means 14 requests in flight; at 500ms, 35. A sequential worker loop
+   reaches about 5 per second and the drain takes 6 hours.
+
+The 26 minutes is a floor measured with no throttling. The brief says that when
+Salesforce tells us to slow down we slow down and keep the work, and any
+throttling response extends the drain by an amount that cannot be predicted
+here.
+
+**Pushback:** The AI raised three points and Abhishek agreed to all three
+before supplying the figures: the drain competes with live traffic, so the
+available rate is the cap minus the live rate; the window is the busiest
+sustained 6 hours and not any 6 hours; and the backlog counts distinct records,
+so a merge ratio has to be stated. The AI then challenged the load profile: a
+peak of 6.67 per second against a 6-hour average of 5 per second is a ratio of
+1.33, which describes near-peak load held flat for six hours. Month-end traffic
+is usually spikier. The figures stand, because the flat profile makes the
+backlog larger and the drain longer, and the design states the conservatism
+deliberately so the profile does not look convenient.
+
+**If wrong:**
+
+- If the portal peak is higher than 10 per second, the headroom for draining
+  shrinks and the drain time rises faster than the backlog does, because the
+  subtracted live rate grows while the cap stays fixed. At a portal peak of 40
+  per second the drain rate halves and 26 minutes becomes about 54 minutes on
+  the same backlog.
+- If the Salesforce-side 6-hour average is much higher than 15 per second, the
+  catch-up query cost grows in proportion, and at roughly 150 per second it
+  starts to compete with the drain for the 20 per second reserve.
+- If merging turns out to be unacceptable to the client, per Q8, the backlog
+  becomes 108,000 edits rather than records and the 26 minutes holds only
+  while the edits-per-record ratio stays at 1.
+
+---
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
