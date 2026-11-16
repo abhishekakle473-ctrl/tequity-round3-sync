@@ -1,0 +1,2714 @@
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+● Verification of the cut
+
+  - Numbers: extracted every numeric token from the previous version and the new
+    one, then diffed. Nothing missing. 61 distinct numbers before, 61 after.
+  - Salesforce facts: checked 34 phrases by text search, covering every verified
+    claim, assumption and mechanism. No misses.
+  - Assumption labels: 8 before, 8 after. "Not determined" entries: 1 before, 1
+    after.
+  - "If wrong" lines: 8 before, 9 after, the extra one belonging to the new
+    portal assumption.
+  - Word count on the whole file: 2,846 down to 2,255.
+  - Two apparent misses in the first pass turned out to be my extraction
+    catching trailing full stops, not lost facts. One of them did show sloppy
+    wording, "becomes about 54", which now says "about 54 minutes".
+  - Verified-claim bullet count fell from 15 to 13 because some bullets merged.
+    Every underlying fact is still there, confirmed by the phrase check.
+
+  What changed in the documents
+
+  - docs/design.md is the spec and stays one file. Each assumption now carries a
+    short lead, its facts, one "if wrong" line, and a pointer to the decision
+    number. The argument lives in the log.
+  - docs/decisions.md gained D10, around 150 words. No earlier entry was
+    touched.
+  - Nothing about tools or plugins appears in either document or in the commit
+    message.
+
+  Holes in the row lock, which you asked me to find
+
+  Your mechanism is right. Four things it needs that you did not say, all now in
+  D10 and the design:
+
+  - The sequence number and the timestamp must both be drawn after the lock is
+    acquired. Drawing the number first leaves the inversion exactly where it
+    was, since nextval ignores transactions. Same for the timestamp: now() fixed
+    at transaction start can still be earlier for the transaction that commits
+    later, even with the lock in place. Reading the clock after the lock fixes
+    both.
+  - The lock must cover the local transaction only. Holding a record row lock
+    across a Salesforce call means 200 to 500 milliseconds of network time
+    inside the lock, so one record would manage two to five saves a second and
+    the concurrency the drain needs collapses.
+  - The inbound path has to take the same lock. Otherwise an applied webhook and
+    a portal save interleave on one record, and the ordering guarantee covers
+    portal saves alone.
+  - A save touching several records needs a fixed lock order, by record
+    identifier. A contact and its customer locked in different orders by two
+    transactions deadlock.
+
+  One thing that is fine and worth knowing: sequence numbers leave gaps when a
+  transaction aborts, since sequences do not roll back. Gaps do no harm to
+  ordering as long as nothing assumes the numbers are contiguous.
+
+  One scope point: the lock orders saves to the same record. Saves to different
+  records stay unordered relative to each other, which is all this design needs.
+
+  Next question: how is a portal-created record identified before Salesforce has
+  given it an ID?
+
+  - The brief says both sides may create. The webhook sample and the portal
+    sample both carry recordId with a Salesforce-shaped value like
+    0031A00000Abc.
+  - A record created in the portal has no such value until the create call
+    returns, and that call may be queued behind a six-hour outage.
+  - So for up to six hours the portal holds records that exist for finance staff
+    and do not exist in Salesforce.
+
+  Option A: our own identifier is the primary key, the Salesforce ID is a
+  nullable column
+
+  - Every record gets a portal identifier at creation, generated locally.
+  - A salesforce_id column stays empty until the create call returns, then gets
+    filled in.
+  - Everything in our system, including history rows and the outbound queue,
+    refers to the portal identifier, so nothing has to be rewritten when the
+    Salesforce ID arrives.
+  - The cost: every inbound webhook needs a lookup from Salesforce ID to portal
+    identifier.
+
+  Option B: the Salesforce ID is the primary key, with a placeholder until it
+  arrives
+
+  - Simpler joins while a record is synced, and it forces a rewrite of every
+    reference the moment the create returns.
+  - Rewriting a primary key that history rows and queue entries point at, under
+    load, is the kind of thing that works until it does not.
+
+  Option C: ask Salesforce to accept an identifier we choose
+
+  - Salesforce has an external ID field pattern used for exactly this, where an
+    upsert keyed on our own value either creates or matches. I have not verified
+    how it behaves for Contact and Account in this client's org, and I would
+    mark it an assumption until checked.
+  - If available it removes the two-phase create entirely, since we could write
+    by our own key from the first call.
+
+  What I would pick
+
+  - A, with C investigated as an improvement on the outbound path.
+  - A portal identifier that never changes is worth more than a tidy join,
+    because the outbound queue, the history table and the shadow copy all point
+    at it, and none of them should need rewriting mid-flight.
+
+  Where I will push back
+
+  - If you pick B, I will argue the primary key rewrite is a real hazard: it
+    happens exactly when the system is busiest, draining after an outage, and a
+    partial rewrite leaves history rows orphaned.
+  - If you want to rely on C without checking it, I will argue that it changes
+    the outbound path's shape and belongs behind a verified claim, since an
+    external ID field has to exist on the object and be configured in the
+    client's org.
+
+  What do you want the primary key to be, and should the design lean on a
+  Salesforce external ID field if the client confirms one exists?
+
+> agree with all 4 lock holes, keep them
+
+  identity. A as the base, our uuid is the primary key and salesforce_id stays
+  null till it comes back. but i want C too, not just as a later improvement.
+  upsert on an external id field like Portal_Id__c is what makes the create
+  safe to retry. if a create times out, or we restart during the outage with
+  the create still in the outbox, sending it again without upsert can make a
+  duplicate contact in salesforce. so C is what makes the outbox replay safe.
+  mark the field existing in their org as an assumption and add it to the
+  client questions
+
+  one case to cover. a sales user edits the record right after our create, and
+  the webhook comes in with a recordId we dont have mapped yet because the
+  create response is not stored. what do we do with it, park it and retry the
+  lookup, or match on Portal_Id__c if the webhook carries it? push back if you
+  see a better way
+
+  log it, update design, commit, then next question
+  ⎿  Read docs\design.md (277 lines)
+  ⎿  Referenced file docs\decisions.md
+  ⎿  Referenced file Round3-Abhishek.html
+  ⎿  Skills restored (superpowers:verification-before-completion,
+     anthropic-skills:bullets, anthropic-skills:anti-ai,
+     superpowers:brainstorming)
+
+● Compacted using a summary written while you were away · turn off with
+  "idleCompaction": false in settings.json
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(sed -n '600,715p' docs/decisions.md && echo "=====QSECTION=====" && grep
+      -n "Q1\.\|Q2\.\|Q3\.\|Q14\|Open questions\|questions for the client"
+      docs/decisions.md…)
+  ⎿  (No output)
+
+● Web Search("Salesforce REST API upsert external ID field PATCH sObject 201
+            created 204 updated 300 multiple choices duplicate")
+  ⎿  Did 1 search in 7s
+
+● Bash(python - <<'PY'
+      import io…)
+  ⎿  Updated docs\decisions.md (+43 -0)
+      655  
+      656  ---
+      657  
+      658 +---                                                           
+      659 +                                                              
+      660 +## D11. A portal record's identity is our own UUID, and Salesf
+          +orce writes go through an upsert on an external ID field      
+      661 +                                                              
+      662 +**Status:** agreed                                            
+      663 +                                                              
+      664 +**Raised by:** Abhishek, asking how a portal-created record is
+          + identified before                                            
+      665 +Salesforce has assigned it an ID.                             
+      666 +                                                              
+      667 +**Problem:** A portal create has no Salesforce ID until the ca
+          +ll returns, which                                             
+      668 +may be hours later during an outage. A retried create with no 
+          +idempotency key                                               
+      669 +makes a duplicate contact in Salesforce.                      
+      670 +                                                              
+      671 +**Options, and why they lost:**                               
+      672 +                                                              
+      673 +- **The Salesforce ID as the primary key, with a placeholder.*
+          +* Rejected: the                                               
+      674 +  key has to be rewritten across history rows, the outbox and 
+          +the shadow copy at                                            
+      675 +  the moment the system is busiest, and a partial rewrite orph
+          +ans history.                                                  
+      676 +- **A create-then-record-the-ID sequence with no external ID.*
+          +* Rejected: a                                                 
+      677 +  timeout or a restart mid-outage replays the create and dupli
+          +cates the record.                                             
+      678 +                                                              
+      679 +**Decision:** Every record carries a portal UUID as its primar
+          +y key, assigned at                                            
+      680 +creation and never changed. `salesforce_id` is a nullable colu
+          +mn filled in when                                             
+      681 +Salesforce answers. Outbound writes for records we created go 
+          +to the upsert                                                 
+      682 +resource keyed on an external ID field holding that UUID, so a
+          + replayed create                                              
+      683 +matches the existing record. An inbound event for an unknown S
+          +alesforce ID is                                               
+      684 +resolved by retrieving the record and checking that field, nev
+          +er parked                                                     
+      685 +immediately; a new Salesforce-origin record arrives this way o
+          +n every create.                                               
+      686 +                                                              
+      687 +**Pushback:** Abhishek rejected the AI's framing of the extern
+          +al ID as a later                                              
+      688 +improvement and made it part of the decision, because the upse
+          +rt is what makes                                              
+      689 +outbox replay safe. The AI argued against matching on an exter
+          +nal ID carried in                                             
+      690 +the webhook payload, since the brief's sample has no such fiel
+          +d and the webhook                                             
+      691 +is a custom mechanism; the retrieve works without it.         
+      692 +                                                              
+      693 +**If wrong:** if no external ID field can be added to Contact 
+          +and Account in the                                            
+      694 +client's org, the create becomes a plain insert guarded by a c
+          +laim row in                                                   
+     … 15 more lines (ctrl+o to expand)
+
+● Bash(python - <<'PY'
+      import io…)
+  ⎿  Updated docs\design.md (+26 -1)
+      250  *If wrong:* without the lock, two saves to one record can comm
+           it in the opposite
+      251  order to their timestamps, and the later save silently loses.
+      252  
+      253 +**A10. A record's identity is a portal UUID, and Salesforce wr
+          +ites are keyed on                                             
+      254 +an external ID field holding it.** A portal create has no Sale
+          +sforce ID until                                               
+      255 +the call returns, which during an outage can be hours. The UUI
+          +D is the primary                                              
+      256 +key everywhere in our database and never changes; `salesforce_
+          +id` is a nullable                                             
+      257 +column filled in when Salesforce answers. Decision D11.       
+      258 +                                                              
+      259 +- **Verified:** the REST API upserts on a custom external ID f
+          +ield, answering                                               
+      260 +  201 when it created a record. A value matching more than one
+          + record answers                                               
+      261 +  300 and writes nothing.                                     
+      262 +- **Verified:** a field marked External ID and Unique acts as 
+          +a unique index and                                            
+      263 +  blocks duplicates. Without Unique, the caller needs View All
+          + Data.                                                        
+      264 +- **Assumption:** such a field can be added to Contact and Acc
+          +ount in the                                                   
+      265 +  client's org. Questions Q15 and Q16 in the decision log.    
+      266 +- An inbound event carrying a Salesforce ID we hold no mapping
+          + for is normal:                                               
+      267 +  every record created by a sales user arrives that way. The r
+          +ecord is                                                      
+      268 +  retrieved, and a populated external ID binds it to the porta
+          +l UUID while an                                               
+      269 +  empty one means a new Salesforce-origin record. Binding happ
+          +ens even when the                                             
+      270 +  event is then dropped as our own echo.                      
+      271 +- A populated external ID pointing at a portal record already 
+          +bound to a                                                    
+      272 +  different Salesforce ID is a duplicate in Salesforce. That o
+          +ne is parked for a                                            
+      273 +  person.                                                     
+      274 +                                                              
+      275 +*If wrong:* with no external ID field available, a create is a
+          + plain insert                                                 
+      276 +guarded by a claim row in Postgres, and duplicates after a tim
+          +eout have to be                                               
+      277 +found by a reconciliation query.                              
+      278 +                                                              
+      279  ### 1.5 Still open
+      280  
+      281  Silent in the brief, with no working assumption yet. Each is t
+           racked in
+      282  `docs/decisions.md` with the reason it matters.
+      283  
+      258 -- How a portal-created record is identified before Salesforce 
+          -assigns it an ID.                                             
+      284  - What the second user sees when two portal users edit the sam
+           e field at once.
+      285  - What happens when Salesforce rejects a write permanently.
+      286  - Whether the initial load of 5 million records is in scope.
+
+● Bash(sed -n '230,275p' docs/design.md)
+  ⎿  (No output)
+
+● Bash(git add -A && git commit -q -F - <<'EOF'
+      Identify records by a portal UUID and key Salesforce writes on an external
+      ID…)
+  ⎿  (No output)
+
+● Logged as D11, design updated, committed as b773367
+
+  - Portal UUID is the primary key, salesforce_id nullable, the upsert on an
+    external ID field is part of the decision and no longer a later improvement.
+  - The field existing in the client's org is marked an assumption, with Q15
+    added to the client questions.
+
+  The upsert facts came back verified
+
+  - A PATCH to the upsert resource keyed on a custom external ID answers 201
+    when it created a record.
+  - A value matching more than one record answers 300 and writes nothing, which
+    gives the duplicate case a defined outcome.
+  - A field marked External ID and Unique works as a unique index and blocks
+    duplicates. Without Unique, the caller needs View All Data permission, so
+    "unique" belongs in the request to the client, not just "external ID".
+  - Status code on an update differs by API version: 204 with no body on version
+    45.0 and earlier, 200 with a body carrying a created flag from 46.0 on. The
+    client's API version has to be pinned before anyone writes the response
+    handling.
+
+  Sources: sObject Rows by External ID (https://developer.salesforce.com/docs/at
+  las.en-us.api_rest.meta/api_rest/dome_upsert.htm), Upsert Records, Bulk API
+  2.0 (https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api/bul
+  k_api_2_0_upsert.htm). Both through search snippets quoting the pages, since
+  the site still answers 403 to a direct fetch.
+
+  Your webhook case, and where I push back
+
+  - Your framing treats an unmapped recordId as an error case. It is the normal
+    case.
+    - Every record a sales user creates in Salesforce arrives with an ID we have
+      never seen.
+    - Park-and-retry would park every inbound create and wait for a mapping that
+      will never appear.
+  - Matching on Portal_Id__c carried in the webhook is the cheap answer, and I
+    would not build on it.
+    - The brief's sample payload carries recordId and changedFields, nothing
+      else.
+    - The webhook is the client's own mechanism, so no documentation says what
+      it can carry.
+    - That makes it an assumption with no fallback, on the path that handles
+      every create.
+  - What I would build instead: an unknown Salesforce ID triggers a retrieve of
+    that record.
+    - A populated external ID binds the Salesforce ID to the portal UUID we
+      already hold.
+    - An empty external ID means a record born in Salesforce, so we insert it.
+    - The retrieve is needed anyway on a changed-fields payload for a record we
+      have never seen, since the payload carries a few fields and we need the
+      rest.
+  - One case that does get parked: a populated external ID pointing at a portal
+    record already bound to a different Salesforce ID.
+    - That is a duplicate contact in Salesforce, created before the upsert
+      existed or by a race.
+    - No automatic rule can pick a winner there.
+  - One ordering detail worth stating now: the binding must happen even when the
+    event is then dropped as our own echo.
+    - The first event after our create is usually that echo, identified as the
+      integration user under the D5 loop rule.
+    - Dropping the event before binding leaves the mapping empty and the next
+      event repeats the retrieve.
+  - Portal_Id__c in the payload stays worth asking for, as Q16, since it saves
+    one retrieve call per new record. The design does not depend on the answer.
+
+  Next question: what happens when Salesforce rejects a write permanently?
+
+  - Retries cover a Salesforce that is unreachable. A validation rule firing, a
+    required field left empty, a picklist value the org does not hold, or a
+    field the integration user cannot write are different: the same call will
+    fail the same way forever.
+  - The brief does not say what should happen to that edit. The portal user has
+    already seen their save succeed.
+
+  What the choice is between
+
+  - Retry a fixed number of times, then park the edit in a table with the
+    Salesforce error, and carry on with the rest of the queue. The record stays
+    wrong in Salesforce until a person acts.
+  - Park it and mark the record in the portal as out of step with Salesforce, so
+    the finance or customer-success user who made the edit can see their change
+    did not reach the sales team.
+  - Roll the portal edit back to the last value Salesforce accepted, so the two
+    systems agree again.
+
+  Where I stand
+
+  - Park plus a visible marker on the record. Rolling back destroys a human's
+    work over a machine's rule, and the person who typed the value is the one
+    who can fix it.
+  - A permanent rejection must leave the outbound queue, or one poisoned record
+    stalls everything behind it. That matters most during the drain after the
+    outage.
+  - Distinguishing permanent from temporary comes down to the status code:
+    400-class means permanent, 500-class and timeouts mean retry. The 403 for
+    API limit exceeded is the trap, since it is 400-class and genuinely
+    temporary.
+
+  What do you want to happen to the edit, and should the portal user see that
+  their save did not reach Salesforce?
+
+> you are right on the unmapped recordId, i had it as an error case and it is
+  the normal case for every salesforce create. go with your retrieve and bind,
+  and bind before we drop our own echo. make sure the client question says
+  external id AND unique
+
+  permanent reject, park plus a marker on the record in the portal, agree. two
+  things. if the user fixes the value, the new edit merges into the parked item
+  and retries it, it does not queue behind it, or that record never recovers.
+  and classify by the error code in the body not only the status,
+  REQUEST_LIMIT_EXCEEDED is a slow down even though its a 403, unknown 4xx gets
+  parked, not retried forever. every retry counts in the 80/sec
+
+  to save turns, close these small ones in the same go, push back only if
+  something is wrong. two portal users same field, the form sends the field
+  version it loaded, stale save is rejected and the user sees who changed it
+  and the new value, salesforce only gets the winner. webhook auth, assume an
+  hmac signature with a shared secret, checked before anything is stored. one
+  service with two processes, webhook endpoint and sync worker, they only talk
+  through postgres tables, inbox and outbox
+
+  also design.md is 2500 words with only section 1 done. before writing more,
+  give me a word budget per section so the whole doc ends near 4000. section 1
+  has to get smaller, move detail to the D entries and keep only the
+  assumption, the number, and the if wrong line
+
+  log, commit, then the big one, the conflict rule when both sides change the
+  same field. give me options and argue against your own pick before i decide
+
+● Bash(python - <<'PY'
+      # -*- coding: utf-8 -*-…)
+  ⎿  Error: Exit code 2
+     /usr/bin/bash: -c: line 166: unexpected EOF while looking for matching `''
+
+  Made 1 scratchpad edit +177 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/add_d12_15.py")
+  ⎿  Updated docs\decisions.md (+151 -1)
+      696  detected by a reconciliation query.
+      697  
+      698  
+      699 +---                                                           
+      700 +                                                              
+      701 +## D12. A permanent Salesforce rejection parks the edit and ma
+          +rks the record in the portal                                  
+      702 +                                                              
+      703 +**Status:** agreed                                            
+      704 +                                                              
+      705 +**Raised by:** Abhishek, asking what happens when Salesforce r
+          +efuses a write for                                            
+      706 +good and not because it is unreachable.                       
+      707 +                                                              
+      708 +**Problem:** A validation rule, a missing required field or a 
+          +field the                                                     
+      709 +integration user cannot write fails the same way on every retr
+          +y. Retrying it                                                
+      710 +forever burns the rate budget and stalls the records behind it
+          +.                                                             
+      711 +                                                              
+      712 +**Options, and why they lost:**                               
+      713 +                                                              
+      714 +- **Roll the portal edit back to the last value Salesforce acc
+          +epted.** Rejected:                                            
+      715 +  it destroys a person's work over a machine's rule, and the p
+          +erson who typed                                               
+      716 +  the value is the one able to fix it.                        
+      717 +- **Retry on a long schedule and leave it in the queue.** Reje
+          +cted: a poisoned                                              
+      718 +  record holds up everything behind it, worst during the outag
+          +e drain.                                                      
+      719 +                                                              
+      720 +**Decision:** The edit leaves the outbound queue, is parked wi
+          +th the Salesforce                                             
+      721 +error, and the record is marked in the portal as out of step w
+          +ith Salesforce.                                               
+      722 +When the user corrects the value, the new edit merges into the
+          + parked item and                                              
+      723 +retries it. It never queues behind it, or the record would nev
+          +er recover.                                                   
+      724 +Classification is by the error code in the response body, not 
+          +the status alone:                                             
+      725 +REQUEST_LIMIT_EXCEEDED arrives as a 403 and means slow down, s
+          +o it backs off                                                
+      726 +across the whole worker and keeps the edit queued. An unrecogn
+          +ised 4xx is                                                   
+      727 +parked, never retried indefinitely. Every retry counts against
+          + the 80 per second                                            
+      728 +operating point.                                              
+      729 +                                                              
+      730 +**Pushback:** Abhishek rejected the AI's open-ended retry fram
+          +ing and added the                                             
+      731 +merge-into-the-parked-item rule and the body-code classificati
+          +on. The AI had                                                
+      732 +proposed classifying on the status code alone, which would hav
+          +e treated a rate                                              
+      733 +limit as permanent.                                           
+      734 +                                                              
+      735 +**If wrong:** if the client expects the two systems to agree a
+          +t all times,                                                  
+     … 125 more lines (ctrl+o to expand)
+
+  Made 1 scratchpad edit +341, searched for 1 pattern (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/rewrite_s1.py")
+  ⎿  Updated docs\design.md (+128 -84)
+      16  ## 1. Assumptions, and the questions to ask before locking the 
+          design
+      17  
+      18  Every claim about Salesforce behaviour is marked **Verified** o
+          r **Assumption**.
+      19 -No Salesforce page could be opened directly during this work, b
+         -ecause                                                         
+      20 -`developer.salesforce.com` answered 403 Forbidden to every requ
+         -est, so verified                                               
+      21 -claims come from search results quoting the documentation. Reco
+         -rded as P1 in the                                              
+      22 -decision log.                                                  
+      19 +No Salesforce page could be opened directly, because `developer
+         +.salesforce.com`                                               
+      20 +answered 403 Forbidden to every request, so verified claims com
+         +e from search                                                  
+      21 +results quoting the documentation. Recorded as P1 in the decisi
+         +on log.                                                        
+      22 +                                                               
+      23 +Each assumption gives its conclusion and one line on what chang
+         +es if it is                                                    
+      24 +wrong. The options that lost, and who argued against what, are 
+         +in the numbered                                                
+      25 +decision it names.                                             
+      26  
+      27  ### 1.1 Load
+      28  
+      26 -**A1. Edit rates are stated per side.** The rate cap counts onl
+         -y the calls we                                                 
+      27 -make to Salesforce, so one blended figure would be wrong. The f
+         -igures are                                                     
+      28 -deliberately conservative: a 6.67 per second peak against a 5 p
+         -er second                                                      
+      29 -six-hour average is a ratio of 1.33, near-peak load held flat f
+         -or six hours,                                                  
+      30 -which enlarges the backlog. Decision D7.                       
+      29 +**A1. Edit rates are stated per side**, because the rate cap co
+         +unts only the                                                  
+      30 +calls we make to Salesforce. The figures are conservative: a 6.
+         +67 per second                                                  
+      31 +portal peak against a 5 per second six-hour average is a ratio 
+         +of 1.33,                                                       
+      32 +near-peak load held flat for six hours. Decision D7.           
+      33  
+      34  Portal side, about 200 finance and customer-success users:
+      35  
+     ...
+      55  **A2. The outage backlog uses the busiest sustained six hours, 
+          and the drain
+      56  shares the cap with live traffic.** Peak covers the 30-second v
+          isibility target;
+      57  a six-hour backlog is a volume problem. The merge ratio is set 
+          to 1, making the
+      56 -result an upper bound, since pending edits to one record collap
+         -se into one call.                                              
+      57 -Decision D7.                                                   
+      58 +result an upper bound. Decision D7.                            
+      59  
+      60  ```
+      61  6 hours                     = 21,600 seconds
+     ...
+      71  
+      72  The live rate subtracted is the portal peak of 10/sec, because 
+          recovery at month
+     … 281 more lines (ctrl+o to expand)
+
+● Bash(git add -A && git commit -q -F - <<'COMMITEOF'
+      Park permanent rejections, version fields per form load, sign webhooks,
+      split endpoint from worker…)
+  ⎿  (No output)
+
+● Bash(sed -e 's/<[^>]*>/ /g' Round3-Abhishek.html | tr -s ' \n' ' \n' | grep -n
+      -i "field\|phone\|email\|status\|owner\|source of truth\|wins" | head
+      -40)
+  ⎿  (No output)
+
+● Logged and committed as 56477b4
+
+  - D12 permanent rejection, D13 field versions from the form, D14 signature on
+    the webhook, D15 the two-process shape.
+  - Q15 now asks for a field marked both External ID and Unique, and says why:
+    Unique is what blocks duplicates, and External ID alone forces the caller to
+    hold View All Data.
+  - Two new client questions came out of this: whether the client's Salesforce
+    side can compute an HMAC signature, and which API version they target, since
+    the upsert answers 204 with no body on 45.0 and earlier and 200 with a body
+    from 46.0 on.
+  - The retrieve-and-bind rule is in, with binding before the echo is dropped.
+
+  Two things I added to your rules, both small:
+
+  - The field version also moves when an inbound Salesforce change touches that
+    field, so the "someone else changed this" message has to be able to name a
+    Salesforce user, not only a colleague down the corridor.
+  - REQUEST_LIMIT_EXCEEDED backs off across the whole worker, not just that
+    record. Backing off one record while the rest keep hammering wastes the
+    signal.
+
+  Word budget
+
+  ┌───────────────────────────────────────────────────┬───────┐
+  │                      Section                      │ Words │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ Intro                                             │ 80    │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 1. Assumptions                                    │ 1,400 │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 2. The systems and the interface on each side     │ 200   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 3. Subproblems, in build order                    │ 100   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 4. The data stored                                │ 350   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 5. The inbound path                               │ 300   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 6. The outbound path                              │ 300   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 7. The conflict rule                              │ 350   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 8. Duplicate and out-of-order webhooks            │ 220   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 9. The loop rule                                  │ 180   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 10. The outage and the arithmetic                 │ 350   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 11. Numbers to watch                              │ 130   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ 12. Out of scope                                  │ 120   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ Appendix: Salesforce claims, verified and assumed │ 300   │
+  ├───────────────────────────────────────────────────┼───────┤
+  │ Total                                             │ 4,380 │
+  └───────────────────────────────────────────────────┴───────┘
+
+  Where I disagree with you on section 1
+
+  - Section 1 is now 2,670 words, up from 2,255, because the four decisions
+    above added five assumptions to it. It is the longest part of the document
+    and you are right that it has to come down.
+  - Getting it to 1,400 takes two moves, and only one of them is pure cutting.
+    - The two arithmetic blocks move to section 10, where the brief asks for the
+      division anyway. That is about 120 words out of section 1 and into a
+      section that needs them.
+    - The verified and assumed Salesforce claims under A3 to A6 and A11, about
+      900 words of bullets, move to a compact appendix table: one row per claim,
+      with its label and where it came from. Same claims, a third of the words.
+  - What I will not do is delete those claims to hit a number. Marking every
+    Salesforce statement verified or assumption is the rule this whole
+    submission is built on, and a reader who has to open the decision log to
+    find out which claims are guesses is being asked to work for it.
+  - If you want 4,000 flat, the appendix goes into docs/decisions.md and section
+    1 points at it. I think that is worse, and it is your call.
+
+  Section 7: which edit is current when both sides change the same field
+
+  The brief asks for this by name: "Say what you use to decide which edit is
+  current, on a webhook and on a portal save. Name the field."
+
+  What we have to compare
+
+  - Salesforce side: occurredAt, the time Salesforce gives the event. It is in
+    the sample webhook.
+  - Portal side: the Postgres server timestamp drawn under the row lock, with
+    the sequence number breaking ties (A10, decision D10).
+  - Those two come from machines nobody synchronised, and that is the whole
+    problem.
+
+  Option A: last write wins per field, comparing occurredAt against the portal
+  timestamp
+
+  - Each field carries the timestamp and the actor of its current value. A
+    change arriving with an older timestamp is written to history and does not
+    become current.
+  - Clock skew is measured instead of assumed: every Salesforce HTTP response
+    carries a Date header, so the worker keeps a running estimate of the offset
+    between their clock and ours and applies it before comparing.
+  - Fits the brief's own words: one current value we can justify, and the
+    earlier values kept.
+
+  Option B: Salesforce wins every conflict
+
+  - Salesforce is the client's system of record and the sales team is bigger, so
+    the tie-break is settled before it happens.
+  - No clock trust at all, which makes it the only option that cannot be quietly
+    wrong.
+  - A finance correction to a shared field loses to a stale sales edit, and the
+    finance user has no way to tell it apart from a bug.
+
+  Option C: each field has an owning side
+
+  - City and status belong to finance, phone and email to sales, and the owner's
+    value wins whatever the clock says.
+  - The brief's scenario is exactly this: the finance person sets the city, the
+    sales person changes the phone, both survive.
+  - It needs the client to assign nine fields, and it surprises people when it
+    fires, since an edit made in the wrong system quietly fails to stick.
+
+  Option D: no automatic winner, the record is marked and a person picks
+
+  - Nothing is ever lost or silently overwritten.
+  - It misses the 30-second target for that field by definition, and at 30 edits
+    a second on the Salesforce side, someone would spend their day on it.
+
+  My pick, and the case against it
+
+  - I would take A, last write wins per field by timestamp, with the loser
+    written to history and the skew offset measured from the Date header. Ties
+    go to Salesforce, so the outcome is deterministic.
+  - Now the argument against it, which is stronger than I would like:
+    - It makes correctness depend on a clock we do not own. If Salesforce's
+      clock runs three seconds ahead and our offset estimate is wrong, every
+      close conflict goes to Salesforce and nothing in the system would ever
+      tell us.
+    - occurredAt is documented nowhere, because the webhook is the client's own
+      mechanism. The brief says it is "the time Salesforce gives the event",
+      which may be the time the field changed or the time the event was sent.
+      Those differ on a retry, and the brief says webhooks arrive out of order
+      and repeat.
+    - Resolution bites at this volume. If-Unmodified-Since compares to one
+      second, and if occurredAt is one second too, 30 Salesforce edits a second
+      produce ties constantly, so the tie-break stops being an edge case and
+      becomes the rule.
+    - The outage makes it concrete. A portal edit made five hours into the
+      outage carries a five-hour-old timestamp. A Salesforce edit from an hour
+      ago beats it, correctly by the rule, and the finance user sees their
+      correction disappear with no explanation. B has the same outcome and at
+      least never pretends a clock decided it.
+  - Which is why C keeps pulling at me: it is the only option where the brief's
+    own scenario cannot go wrong, and the only one that does not depend on a
+    timestamp we cannot verify.
+
+  What decides it for me is whether occurredAt is trustworthy, and that is a
+  question for the client, not something I can settle here. If you want A, I
+  will build it with the measured offset and a counter on how often conflicts
+  resolve within one second, so the assumption is visible when it starts
+  failing.
+> budget is fine, go with about 4400 and the appendix table for the salesforce
+  claims. agree you dont delete claims to hit a number
+
+  conflict rule. good that you argued against yourself, two of the arguments
+  dont hold though. ties constantly is wrong. a conflict needs the same field
+  on the same record from both sides inside the same second. rough math, a
+  portal edit has about 30/sec x 2 sec / 5M = 0.000012 chance a salesforce edit
+  hits the same record in that window, at 10 portal edits/sec thats about 0.4
+  an hour at peak, before same field. real traffic clusters on hot records so
+  we count it, but its rare. check my math with
+  /superpowers:verification-before-completion. and the outage case is not a
+  flaw of A, if the salesforce edit came later it should win. the gap is the
+  finance user not knowing why, and history plus a note covers that
+
+  so A. per field last writer wins on occurredAt vs our server time, skew
+  measured from the Date header. inside 1 sec its too close to call, salesforce
+  wins, both values go to history, counter goes up. if that counter climbs we
+  look at field ownership, C, which goes to the client as a question not into
+  the design now. occurredAt being edit time not send time is an assumption
+  plus a client question
+
+  that closes the open design questions. now write sections 2 to 12 to the
+  budget in one go. my calls for the ones we did not discuss. subproblem order,
+  field level data model and history first because everything sits on it and
+  its hardest to change later, then inbound apply with dedupe and order, then
+  outbox and rate limiter, then loop rule, then catch up poll and outage, then
+  monitoring. three numbers to watch, oldest pending outbox age call at 60 sec
+  while salesforce is up, parked plus failed count call if it grows 10 min
+  straight, changes found by the poll with no webhook call over 1 percent. out
+  of scope, deletes, ui, initial load of 5M assume in sync, second region, code
+
+  commit per section or two. tell me when its done and the word count, then we
+  do the builder check
+
+● Bash(python -c "
+      records=5_000_000…)
+  ⎿  (No output)
+
+  Made 2 scratchpad edits +148 -1 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/add_d16_19.py" && git add -A &&
+      git commit -q -…)
+  ⎿  Updated docs\decisions.md (+126 -0)
+      844  into separate deployable units with no change to the tables be
+           tween them.
+      845  
+      846  
+      847 +---                                                           
+      848 +                                                              
+      849 +## D16. The current value of a field is the later edit, by occ
+          +urredAt against our server time                               
+      850 +                                                              
+      851 +**Status:** agreed                                            
+      852 +                                                              
+      853 +**Raised by:** The brief, which asks what decides which edit i
+          +s current, on a                                               
+      854 +webhook and on a portal save, and asks for the field to be nam
+          +ed.                                                           
+      855 +                                                              
+      856 +**Problem:** Both sides may change the same field. One value h
+          +as to be current,                                             
+      857 +the other has to stay on record, and the two timestamps come f
+          +rom machines                                                  
+      858 +nobody synchronised.                                          
+      859 +                                                              
+      860 +**Options, and why they lost:**                               
+      861 +                                                              
+      862 +- **Salesforce wins every conflict.** Rejected: a finance corr
+          +ection loses to a                                             
+      863 +  stale sales edit with nothing to distinguish it from a defec
+          +t.                                                            
+      864 +- **Each field has an owning side.** Held back, not rejected. 
+          +It is the only                                                
+      865 +  rule that cannot be wrong about the brief's own scenario, an
+          +d it needs the                                                
+      866 +  client to assign nine fields. It goes to the client as Q20 a
+          +nd is the fallback                                            
+      867 +  if the too-close-to-call counter climbs.                    
+      868 +- **No automatic winner, a person picks.** Rejected: it misses
+          + the 30-second                                                
+      869 +  target by construction.                                     
+      870 +                                                              
+      871 +**Decision:** Per field, the later edit is current. The Salesf
+          +orce side is                                                  
+      872 +`occurredAt` from the webhook; our side is the Postgres server
+          + timestamp taken                                              
+      873 +under the row lock, with the sequence number from D10 breaking
+          + ties among portal                                            
+      874 +saves. Clock skew is measured, not assumed: every Salesforce r
+          +esponse carries an                                            
+      875 +HTTP `Date` header, and the worker keeps a running offset and 
+          +applies it before                                             
+      876 +comparing. Inside one second the two are too close to call, Sa
+          +lesforce wins, and                                            
+      877 +a counter goes up. The losing value is written to history eith
+          +er way, so no edit                                            
+      878 +is ever discarded.                                            
+      879 +                                                              
+      880 +**Pushback:** Abhishek rejected two of the AI's own arguments 
+          +against this rule.                                            
+      881 +The AI claimed ties would be constant at 30 edits a second, wh
+          +ich confused any                                              
+      882 +two edits in a second with two edits to the same field of the 
+          +same record.                                                  
+      883 +Abhishek's arithmetic, checked and reproduced: 30 Salesforce e
+          +dits a second over                                            
+     … 98 more lines (ctrl+o to expand)
+
+● Now the document. Writing section 1 down to budget plus sections 2 to 4.
+
+  Made 1 scratchpad edit +216 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/design_s1.py")
+  ⎿  Updated docs\design.md (+45 -161)
+      16  ## 1. Assumptions, and the questions to ask before locking the 
+          design
+      17  
+      18  Every claim about Salesforce behaviour is marked **Verified** o
+          r **Assumption**.
+      19 -No Salesforce page could be opened directly, because `developer
+         -.salesforce.com`                                               
+      20 -answered 403 Forbidden to every request, so verified claims com
+         -e from search                                                  
+      21 -results quoting the documentation. Recorded as P1 in the decisi
+         -on log.                                                        
+      19 +The claims themselves are in the appendix, one line each. No Sa
+         +lesforce page                                                  
+      20 +could be opened directly, because `developer.salesforce.com` an
+         +swered 403                                                     
+      21 +Forbidden to every request, so verified claims come from search
+         + results quoting                                               
+      22 +the documentation. Recorded as P1 in the decision log.         
+      23  
+      23 -Each assumption gives its conclusion and one line on what chang
+         -es if it is                                                    
+      24 -wrong. The options that lost, and who argued against what, are 
+         -in the numbered                                                
+      25 -decision it names.                                             
+      24 +Each assumption below gives its conclusion and one line on what
+         + changes if it is                                              
+      25 +wrong. The options that lost, the arithmetic and who argued aga
+         +inst what are in                                               
+      26 +the numbered decision it names.                                
+      27  
+      28  ### 1.1 Load
+      29  
+     ...
+      32  portal peak against a 5 per second six-hour average is a ratio 
+          of 1.33,
+      33  near-peak load held flat for six hours. Decision D7.
+      34  
+      34 -Portal side, about 200 finance and customer-success users:     
+      35 -                                                               
+      36 -| Measure | Rate | Source |                                    
+      37 -|---|---|---|                                                  
+      38 -| Peak | 10/sec | 200 users x 2 saves a minute at month end = 6
+         -.67/sec, rounded up |                                          
+      39 -| Busiest sustained 6 hours | 5/sec | Sizes an outage backlog |
+      40 -| Quiet hour | 0.5/sec | |                                     
+      41 -                                                               
+      42 -Salesforce side, a larger sales team plus automation:          
+      43 -                                                               
+      44 -| Measure | Rate | Source |                                    
+      45 -|---|---|---|                                                  
+      46 -| Peak | 30/sec | Stated figure |                              
+      47 -| Busiest sustained 6 hours | 15/sec | The portal side's 2:1 pe
+         -ak-to-average ratio applied. Used only for query cost. |       
+      35 +| Side | Peak | Busiest sustained 6 hours | Quiet hour |       
+      36 +|---|---|---|---|                                              
+      37 +| Portal, about 200 finance and customer-success users | 10/sec
+         +, from 200 users x 2 saves a minute at month end = 6.67/sec, ro
+         +unded up | 5/sec, which sizes the outage backlog | 0.5/sec |   
+     … 246 more lines (ctrl+o to expand)
+
+  Made 1 scratchpad edit +81 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/design_s2_4.py" && python -c "
+      import re,io…)
+  ⎿  Updated docs\design.md (+67 -13)
+      214  - Whether `occurredAt` is the time the field changed or the ti
+           me the event was
+      215    sent. Section 7 depends on it. Question Q19.
+      216  
+      217 -## Sections still to be written                               
+      218 -                                                              
+      219 -2. The systems, who calls whom, the network boundary, and the 
+          -interface on each side                                        
+      220 -3. The subproblems, in the order to build them                
+      221 -4. The data stored                                            
+      222 -5. The inbound path, from webhook to our database             
+      223 -6. The outbound path, from a portal edit to a Salesforce API c
+          -all                                                           
+      224 -7. The rule when both sides change the same record            
+      225 -8. The rule for a duplicate webhook, and for an older webhook 
+          -arriving after a newer one                                    
+      226 -9. The rule that stops a loop                                 
+      227 -10. The 6-hour outage: what is on disk, how it drains, and the
+          - arithmetic                                                   
+      228 -11. Three numbers to watch, and the value at which to call som
+          -eone                                                          
+      229 -12. What is left out of this weekend's work                   
+      217 +## 2. The systems, who calls whom, and the interface on each s
+          +ide                                                           
+      218 +                                                              
+      219 +Salesforce is the client's and stays as it is. Our side is one
+          + service with two                                             
+      220 +processes and one Postgres database (A14). The portal reads an
+          +d writes that                                                 
+      221 +database directly and never calls Salesforce itself.          
+      222 +                                                              
+      223 +Traffic crosses the boundary in two directions, both over HTTP
+          +S:                                                            
+      224 +                                                              
+      225 +- Salesforce to us: an HTTP POST to one endpoint, `/webhook/sa
+          +lesforce`, signed                                             
+      226 +  with a shared secret (A9). This is the only thing Salesforce
+          + sends us.                                                    
+      227 +- Us to Salesforce: REST calls as a dedicated integration user
+          + (A6). Four kinds,                                            
+      228 +  and no others. A PATCH to the upsert resource keyed on the e
+          +xternal ID field,                                             
+      229 +  which is every write we make. A SOQL query on SystemModstamp
+          +, which is the                                                
+      230 +  catch-up poll. A record retrieve, for a Salesforce ID we hol
+          +d no mapping for.                                             
+      231 +  A query against ContactHistory and AccountHistory, for the h
+          +istory of an                                                  
+      232 +  outage window.                                              
+      233 +                                                              
+      234 +Salesforce never reads our database, and we never run code ins
+          +ide Salesforce.                                               
+      235 +Four things have to change on the client's side before any of 
+          +this works: field                                             
+      236 +history tracking switched on for the nine fields, a custom fie
+          +ld marked External                                            
+      237 +ID and Unique added to Contact and Account, an integration use
+          +r created with                                                
+      238 +outbound webhook sending switched off for its profile, and the
+          + webhook                                                      
+      239 +configured to sign its payload.                               
+      240 +                                                              
+     … 43 more lines (ctrl+o to expand)
+
+  Made 1 scratchpad edit +79 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/design_s5_6.py" && git add -A &&
+      git commit -q…)
+  ⎿  Updated docs\design.md (+65 -0)
+      281  stops. It is partitioned by month so old partitions can be det
+           ached, and nothing
+      282  in the sync path queries it.
+      283  
+      284 +## 5. The inbound path, from webhook to our database          
+      285 +                                                              
+      286 +The endpoint does as little as it can, because it has to answe
+          +r in                                                          
+      287 +milliseconds while the worker may be blocked for six hours (A1
+          +4).                                                           
+      288 +                                                              
+      289 +1. Verify the signature over the raw bytes, before parsing (A9
+          +). A failure is                                               
+      290 +   refused with a 401 and nothing is stored.                  
+      291 +2. Compute the deduplication key and insert a row into `inbox`
+          +. A key already                                               
+      292 +   present means a repeat delivery, and the insert does nothin
+          +g.                                                            
+      293 +3. Answer 200. The webhook is now durable, and a restart canno
+          +t lose it.                                                    
+      294 +                                                              
+      295 +The worker then claims inbox rows with `SELECT ... FOR UPDATE 
+          +SKIP LOCKED` and,                                             
+      296 +for each one:                                                 
+      297 +                                                              
+      298 +1. Normalise the payload through the adapter into a list of fi
+          +eld changes, each                                             
+      299 +   with field name, new value, event time and actor (A7). A pa
+          +yload the adapter                                             
+      300 +   cannot interpret is parked and counted, and the row is mark
+          +ed parked rather                                              
+      301 +   than retried.                                              
+      302 +2. Resolve the record. A known `salesforce_id` maps to a porta
+          +l UUID. An unknown                                            
+      303 +   one is retrieved from Salesforce, and its external ID eithe
+          +r binds it to an                                              
+      304 +   existing portal record or shows it to be new (A11).        
+      305 +3. Take the record's row lock, the same lock a portal save tak
+          +es (A10).                                                     
+      306 +4. Apply the loop rule (section 9). An echo of our own write s
+          +tops here, after                                              
+      307 +   the binding in step 2 has been kept.                       
+      308 +5. For each changed field, apply the conflict rule (section 7)
+          +, write                                                       
+      309 +   `field_history`, update `field_value` when the change wins,
+          + and update                                                   
+      310 +   `salesforce_shadow` either way, since the shadow is what Sa
+          +lesforce holds and                                            
+      311 +   not what we chose.                                         
+      312 +6. Mark the inbox row applied, in the same transaction as the 
+          +writes.                                                       
+      313 +                                                              
+      314 +Nothing in this path calls Salesforce except step 2, and only 
+          +for a record we                                               
+      315 +have never seen.                                              
+      316 +                                                              
+      317 +## 6. The outbound path, from a portal edit to a Salesforce AP
+          +I call                                                        
+      318 +                                                              
+      319 +A portal save takes the record's row lock, draws the sequence 
+          +number and the                                                
+      320 +server timestamp under it (A10), checks the field versions the
+          + form carried                                                 
+     … 28 more lines (ctrl+o to expand)
+
+  Made 1 scratchpad edit +101 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/design_s7_9.py" && git add -A &&
+      git commit -q…)
+  ⎿  Updated docs\design.md (+90 -0)
+      346  of requests needed to reach the rate at the measured round-tri
+           p time, which is
+      347  14 in flight at 200 milliseconds.
+      348  
+      349 +## 7. The rule when both sides change the same field          
+      350 +                                                              
+      351 +The comparison is per field, never per record, so an edit to t
+          +he city and an                                                
+      352 +edit to the phone both survive with no conflict at all. That c
+          +overs the brief's                                             
+      353 +own scenario.                                                 
+      354 +                                                              
+      355 +The fields compared, named as the brief asks:                 
+      356 +                                                              
+      357 +- Salesforce side: `occurredAt` from the webhook, the time Sal
+          +esforce gives the                                             
+      358 +  event.                                                      
+      359 +- Our side: the Postgres server timestamp taken under the row 
+          +lock, with the                                                
+      360 +  sequence number breaking ties among portal saves (A10).     
+      361 +                                                              
+      362 +The later one is current. Both values are written to `field_hi
+          +story` either way,                                            
+      363 +so the edit that loses is kept with its actor and its time, an
+          +d nothing is                                                  
+      364 +discarded.                                                    
+      365 +                                                              
+      366 +Those two clocks were never synchronised, so the offset betwee
+          +n them is                                                     
+      367 +measured and not assumed. Every Salesforce HTTP response carri
+          +es a `Date`                                                   
+      368 +header, and the worker keeps a running estimate of the differe
+          +nce against its                                               
+      369 +own clock and applies it before comparing. When the two times 
+          +are within one                                                
+      370 +second of each other after that correction, they are too close
+          + to call:                                                     
+      371 +Salesforce wins, and a counter records it.                    
+      372 +                                                              
+      373 +That counter is the honest part of this rule. It is the number
+          + that would show                                              
+      374 +the rule failing. How often it should fire, at the rates in A1
+          +:                                                             
+      375 +                                                              
+      376 +```                                                           
+      377 +Salesforce edits in a 2-second window = 30/sec x 2 = 60 record
+          +s                                                             
+      378 +chance one of them is a given record  = 60 / 5,000,000 = 0.000
+          +012                                                           
+      379 +portal edits in an hour at peak       = 10/sec x 3,600 = 36,00
+          +0                                                             
+      380 +collisions per hour, any field        = 36,000 x 0.000012 = ab
+          +out 0.43                                                      
+      381 +collisions per hour, same field       = about 0.07 if edits sp
+          +read evenly                                                   
+      382 +```                                                           
+      383 +                                                              
+      384 +Roughly one collision on any field every two hours at peak, an
+          +d well under one a                                            
+      385 +day on the same field. Edits cluster on busy records, so the m
+          +easured figure                                                
+     … 53 more lines (ctrl+o to expand)
+
+  Made 1 scratchpad edit +123 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/design_s10_end.py" && python -
+      <<'PYEOF'
+      import…)
+  ⎿  Updated docs\design.md (+118 -6)
+      68  values only, so a phone number changed three times during the o
+          utage comes back
+      69  as one number, which the brief counts as losing a change. Track
+          ing is off by
+      70  default, per field, so this is the assumption that matters most
+           in the whole
+      71 -document. Decision D2, claims C5 to C10.                       
+      71 +document. Decision D2, claims C5 to C11.                       
+      72  
+      73  *If wrong:* with tracking off, the outage window's intermediate
+           values are
+      74  unrecoverable by any API, and catch-up records one synthetic hi
+          story entry per
+     ...
+      77  **A5. A conditional update is available, and it is weak.** `If-
+          Unmodified-Since`
+      78  compares to the record's last modified date at one-second resol
+          ution, so 412 is
+      79  an ordinary outcome meaning re-read and re-merge, and field-lev
+          el version
+      80 -information is kept on our side. Decision D6, claims C11 to C16
+         -.                                                              
+      80 +information is kept on our side. Decision D6, claims C12 to C17
+         +.                                                              
+      81  
+      82  *If wrong:* unsupported on Contact, every outbound write become
+          s a
+      83  read-then-write with no server-side protection, needing a short
+           row lock in
+     ...
+      86  **A6. Our own write comes back identified as our integration us
+          er.** The loop
+      87  rule checks identity first, then compares values, because a Sal
+          esforce
+      88  automation firing after our write changes the record again unde
+          r a different
+      89 -actor, and that change is genuine. Decision D5, claims C17 to C
+         -19.                                                            
+      89 +actor, and that change is genuine. Decision D5, claims C18 to C
+         +20.                                                            
+      90  
+      91  *If wrong:* without a usable `changedBy`, every inbound event g
+          oes through value
+      92  comparison; loop protection holds and inbound throughput suffer
+          s.
+     ...
+      114  is chosen for repair time. Decision D9.
+      115  
+      116  Salesforce makes a change visible to a SystemModstamp query so
+           me short time
+      117 -after it commits, and no documentation states the lag (claim C
+          -23), so each                                                  
+      117 +after it commits, and no documentation states the lag (claim C
+          +26), so each                                                  
+      118  window overlaps the last generously and stops short of the pre
+           sent moment.
+      119  
+      120  *If wrong:* a visibility lag longer than the overlap loses cha
+           nges silently,
+     ...
+      153  an external ID field holding it.** The UUID is the primary key
+            everywhere in our
+      154  database and never changes; `salesforce_id` is a nullable colu
+           mn filled in when
+      155  Salesforce answers. A replayed create matches the existing rec
+           ord instead of
+      156 -making a second one. Decision D11, claims C20 to C22.         
+      156 +making a second one. Decision D11, claims C21 to C25.         
+      157  
+      158  - An inbound event carrying a Salesforce ID we hold no mapping
+            for is normal:
+      159    every record created by a sales user arrives that way. The r
+           ecord is
+     … 123 more lines (ctrl+o to expand)
+
+● Bash(python - <<'PYEOF'
+      import io,re…)
+  ⎿  (No output)
+
+● Trimming toward the budget.
+
+  Made 1 scratchpad edit +217 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/trim.py")
+  ⎿  Updated docs\design.md (+74 -87)
+      15  
+      16  ## 1. Assumptions, and the questions to ask before locking the 
+          design
+      17  
+      18 -Every claim about Salesforce behaviour is marked **Verified** o
+         -r **Assumption**.                                              
+      19 -The claims themselves are in the appendix, one line each. No Sa
+         -lesforce page                                                  
+      20 -could be opened directly, because `developer.salesforce.com` an
+         -swered 403                                                     
+      21 -Forbidden to every request, so verified claims come from search
+         - results quoting                                               
+      22 -the documentation. Recorded as P1 in the decision log.         
+      23 -                                                               
+      24 -Each assumption below gives its conclusion and one line on what
+         - changes if it is                                              
+      25 -wrong. The options that lost, the arithmetic and who argued aga
+         -inst what are in                                               
+      26 -the numbered decision it names.                                
+      18 +Every claim about Salesforce behaviour is marked **Verified** o
+         +r                                                              
+      19 +**Assumption** in the appendix, one line each. Each assumption 
+         +below gives its                                                
+      20 +conclusion and one line on what changes if it is wrong; the opt
+         +ions that lost                                                 
+      21 +and who argued against what are in the numbered decision it nam
+         +es.                                                            
+      22  
+      23  ### 1.1 Load
+      24  
+      25  **A1. Edit rates are stated per side**, because the rate cap co
+          unts only the
+      31 -calls we make to Salesforce. The figures are conservative: a 6.
+         -67 per second                                                  
+      32 -portal peak against a 5 per second six-hour average is a ratio 
+         -of 1.33,                                                       
+      33 -near-peak load held flat for six hours. Decision D7.           
+      26 +calls we make. A 6.67/sec portal peak against a 5/sec six-hour 
+         +average is a                                                   
+      27 +ratio of 1.33, near-peak load held flat for six hours. Decision
+         + D7.                                                           
+      28  
+      35 -| Side | Peak | Busiest sustained 6 hours | Quiet hour |       
+      29 +| Side | Peak | Busiest 6 hours | Quiet hour |                 
+      30  |---|---|---|---|
+      37 -| Portal, about 200 finance and customer-success users | 10/sec
+         -, from 200 users x 2 saves a minute at month end = 6.67/sec, ro
+         -unded up | 5/sec, which sizes the outage backlog | 0.5/sec |   
+      38 -| Salesforce, a larger sales team plus automation | 30/sec | 15
+         -/sec, the portal's 2:1 ratio applied, used only for query cost 
+         -| |                                                            
+      31 +| Portal, 200 finance and customer-success users | 10/sec, from
+         + 200 x 2 saves a minute = 6.67/sec, rounded up | 5/sec, which s
+         +izes the outage backlog | 0.5/sec |                            
+      32 +| Salesforce, a larger sales team plus automation | 30/sec | 15
+         +/sec, the portal's 2:1 ratio applied, used for query cost only 
+         +| |                                                            
+      33  
+      34  Operating point: **80 requests per second** against the cap of 
+          100, holding
+      35  **20 per second** for retries and catch-up queries.
+     ...
+      38  in section 10 becomes about 54 minutes.
+      39  
+      40  **A2. The outage backlog uses the busiest sustained six hours, 
+          and the drain
+      47 -shares the cap with live traffic.** Peak covers the 30-second v
+         -isibility target;                                              
+     … 209 more lines (ctrl+o to expand)
+
+● Bash(python - <<'PYEOF'
+      import io,re…)
+  ⎿  (No output)
+
+● Bash(git add -A && git commit -q -F - <<'COMMITEOF'
+      Drain the outage in the open, name the three numbers, and list every
+      Salesforce claim…)
+  ⎿  (No output)
+
+● Bash(python - <<'PYEOF'
+      import io,re…)
+  ⎿  (No output)
+
+● Sections 2 to 12 and the appendix are written. Five commits, one per section
+  group.
+
+  Your collision math checks out
+
+  - 30 Salesforce edits a second over a 2-second window touch 60 records. 60 ÷
+    5,000,000 = 0.000012. Correct.
+  - 10 portal edits a second is 36,000 an hour. 36,000 × 0.000012 = 0.43 an
+    hour. Your 0.4 is right.
+  - Spread evenly over the six contact fields, same-field collisions are about
+    0.07 an hour, so roughly one every fortnight at a sustained peak.
+  - You were right on both counts. My "ties constantly" argument confused any
+    two edits in a second with two edits to the same field of one record, and
+    the outage case is the rule working, not failing. Both corrections are
+    recorded in D16 with the arithmetic, and the counter stays because hot
+    records cluster.
+
+  Word count, and where I missed
+
+  ┌────────────────────────────────┬────────┬────────┐
+  │            Section             │ Budget │ Actual │
+  ├────────────────────────────────┼────────┼────────┤
+  │ Intro                          │ 80     │ 127    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 1. Assumptions                 │ 1,400  │ 1,696  │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 2. Systems and interfaces      │ 200    │ 222    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 3. Build order                 │ 100    │ 80     │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 4. Data stored                 │ 350    │ 428    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 5. Inbound path                │ 300    │ 298    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 6. Outbound path               │ 300    │ 348    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 7. Conflict rule               │ 350    │ 402    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 8. Duplicate and late webhooks │ 220    │ 202    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 9. Loop rule                   │ 180    │ 168    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 10. Outage and arithmetic      │ 350    │ 407    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 11. Numbers to watch           │ 130    │ 149    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ 12. Out of scope               │ 120    │ 120    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ Appendix                       │ 300    │ 676    │
+  ├────────────────────────────────┼────────┼────────┤
+  │ Total                          │ 4,380  │ 5,323  │
+  └────────────────────────────────┴────────┴────────┘
+
+  - Sections 2 to 12 came in at 2,824 against 2,600 budgeted, which is close.
+  - The two misses are section 1 and the appendix, and the appendix is my
+    estimating error: 28 claims at one row each cannot fit in 300 words. 676 is
+    what 28 rows cost.
+  - Section 1 holds 14 assumptions. At a four-line lead plus one if-wrong line
+    each, the floor is around 1,350. It is at 1,696, so about 300 of honest
+    trimming is left in it.
+  - I ran a trim pass and got 149 words out without touching a fact. Past that,
+    cutting means deleting content, and you told me not to do that to hit a
+    number.
+  - The one lever left: move the appendix into docs/decisions.md and have
+    section 1 point at it. That gives 4,647, and it is the thing you already
+    said no to. Your call whether 5,323 is acceptable or the appendix moves.
+
+  What the document now says
+
+  - Build order follows yours, with the field-level model and history first.
+  - The three numbers and their thresholds are section 11, with the
+    too-close-to-call counter watched alongside them as the signal that the
+    conflict rule needs replacing.
+  - Out of scope covers deletes, a user interface, the initial load with both
+    sides assumed in step, a second region, and code.
+  - Decisions D16 through D19 cover the conflict rule, the build order, the
+    monitoring thresholds and the scope. Questions Q19 and Q20 went to the
+    client list: whether occurredAt is the edit time or the send time, and who
+    owns each of the nine fields if ownership ever has to decide conflicts.
+
+  Checked before saying it was done
+
+  - All 12 sections present, no placeholder text left.
+  - Every cross-reference resolves: 14 assumptions, 28 claims, every D number,
+    every Q number, no dangling pointer in either direction.
+
+  Ready for the builder check whenever you want it.
+
+> read the full doc, good work. found three bugs before the builder check
+
+  loop rule. you wrote that automation after our write runs under a different
+  actor. in salesforce record triggered flows and triggers run as the user who
+  made the edit, which is our integration user. so identity first drops the
+  automation change, the exact thing the rule says it protects. fix: identity
+  only marks it as likely echo, then compare each field with what we sent, drop
+  the fields that match, apply the ones that differ. mark the claim about
+  which user automation runs as verified or assumption
+
+  duplicates. the brief webhook has eventId and section 8 does not use it.
+  eventId is the key with a unique index, the composite key only as a fallback
+  if eventId is missing. right now two real edits can collapse and we lose an
+  actor, that breaks the who changed it requirement
+
+  outage drain. the math takes 10/sec for live traffic but nothing makes live
+  go first. if outbox is fifo a new edit waits up to 26 min behind the backlog
+  while both sides are up, and the 60 sec alert fires the whole drain. use two
+  lanes, live first, backlog gets what is left. alert on live lane age, and
+  show backlog expected drain time as its own number
+
+  small ones. add a small ascii diagram to section 2, like the brief. section
+  12 says code is out of scope, brief says optional, fix the wording. 5300
+  words is ok, one trim on section 1 only, no more cutting turns
+
+  log the fixes as new D entries, commit, then run the builder check from
+  brainstorming with a fresh agent reading design.md as a teammate who was not
+  on the call. sort what it asks the way the skill says and bring me only my
+  pile
+
+● Bash(sed -e 's/<[^>]*>/ /g' Round3-Abhishek.html | sed -n '588,606p')
+  ⎿  (No output)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Web Search("Salesforce record-triggered flow LastModifiedById running user
+            integration user Apex trigger same user who made the DML")  ⎿  Did 1 search in 6s
+
+● Bash(sed -e 's/<[^>]*>/ /g' Round3-Abhishek.html | grep -o -i
+      "[^.]*\(optional\|if you write a program\|fake CRM\)[^.]*\." | head)
+  ⎿  (No output)
+
+  Made 1 scratchpad edit +144 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/add_d20_22.py" && grep -n
+      "Status:\*\* supersed…)
+  ⎿  Updated docs\decisions.md (+112 -1)
+      232  
+      233  ## D5. The loop rule checks identity first, then compares valu
+           es
+      234  
+      235 -**Status:** agreed                                            
+      235 +**Status:** superseded by D20                                 
+      236  
+      237  **Raised by:** Abhishek asked whether the echo of our own upda
+           te identifies our
+      238  integration user. The AI argued that identity alone is insuffi
+           cient.
+     ...
+       968  operating point, and the catch-up watermark has to start afte
+            r it finishes.
+       969  
+       970  
+       971 +---                                                          
+       972 +                                                             
+       973 +## D20. Identity marks an event as a likely echo; the field c
+           +omparison decides                                            
+       974 +                                                             
+       975 +**Status:** agreed, supersedes D5                            
+       976 +                                                             
+       977 +**Raised by:** Abhishek, reading section 9 of the design.    
+       978 +                                                             
+       979 +**Problem:** D5 dropped an inbound event outright when `chang
+           +edBy` was our                                                
+       980 +integration user, on the reasoning that a Salesforce automati
+           +on firing after our                                          
+       981 +write would carry a different actor. That reasoning is wrong.
+           + A record-triggered                                          
+       982 +flow runs as the user who made the edit, which for our write 
+           +is our integration                                           
+       983 +user, and the last modifier it stamps is that same user. So t
+           +he identity check                                            
+       984 +would drop exactly the automation change it claimed to protec
+           +t, and the portal                                            
+       985 +would never see a value Salesforce computed from our write.  
+       986 +                                                             
+       987 +**Options, and why they lost:**                              
+       988 +                                                             
+       989 +- **Drop on identity alone.** Rejected: it silently loses eve
+           +ry automation                                                
+       990 +  result, and the loss is invisible because no error is raise
+           +d.                                                           
+       991 +- **Drop the identity check and compare values only.** Reject
+           +ed: identity is                                              
+       992 +  cheap, and it is a correct signal for which comparison to r
+           +un.                                                          
+       993 +                                                             
+       994 +**Decision:** An event whose `changedBy` is our integration u
+           +ser is marked a                                              
+       995 +likely echo, not discarded. Each changed field in it is compa
+           +red against the                                              
+       996 +value we sent for that record, held in the shadow copy. Field
+           +s that match are                                             
+       997 +dropped as our own echo. Fields that differ are applied as ge
+           +nuine Salesforce                                             
+       998 +changes, because something in the org changed them after our 
+           +write. An event                                              
+       999 +from any other actor skips the echo comparison entirely.     
+     … 91 more lines (ctrl+o to expand)
+
+  Made 1 scratchpad edit +218 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/fix_bugs.py" && python - <<'PYEOF'
+      import io,re…)
+  ⎿  Updated docs\design.md (+98 -56)
+      76  read-then-write with no server-side protection, needing a short
+           row lock in
+      77  Postgres for the duration of the call.
+      78  
+      79 -**A6. Our own write comes back identified as our integration us
+         -er.** The loop                                                 
+      80 -rule checks identity first, then compares values, because a Sal
+         -esforce                                                        
+      81 -automation firing after our write changes the record again unde
+         -r a different                                                  
+      82 -actor, and that change is genuine. Decision D5, claims C18 to C
+         -20.                                                            
+      79 +**A6. Our own write comes back identified as our integration us
+         +er, and so does                                                
+      80 +any automation it sets off.** A record-triggered flow runs as t
+         +he user who made                                               
+      81 +the edit, so identity alone cannot separate our echo from a cha
+         +nge the org made                                               
+      82 +afterwards. Identity marks an event a likely echo; the comparis
+         +on against what                                                
+      83 +we sent decides, field by field. Decision D20, claims C18 to C2
+         +0 and C29 to C30.                                              
+      84  
+      84 -*If wrong:* without a usable `changedBy`, every inbound event g
+         -oes through value                                              
+      85 -comparison; loop protection holds and inbound throughput suffer
+         -s.                                                             
+      85 +*If wrong:* if this org's automation runs under a different use
+         +r, the identity                                                
+      86 +check alone would have been enough and this rule gives the same
+         + answer anyway.                                                
+      87  
+      88  ### 1.3 The inbound path
+      89  
+     ...
+      100  deliberately cleared.
+      101  
+      102  **A8. The catch-up query runs every minute, all the time.** A 
+           changed-fields
+      102 -payload never re-asserts state, so one webhook lost to a netwo
+          -rk failure leaves                                             
+      103 -a record wrong until somebody edits that field again. The same
+          - query covers a                                               
+      104 -lost webhook and a six-hour outage, at 2 calls a minute out of
+          - 4,800, which is                                              
+      105 -0.04 per cent. The cost is the per-object floor and not the re
+          -cord volume, so                                               
+      106 -polling more often is close to free; one minute is chosen for 
+          -repair time.                                                  
+      107 -Because the lag between a Salesforce commit and its visibility
+          - to a query is                                                
+      108 -undocumented (claim C26), each window overlaps the last genero
+          -usly and stops                                                
+      109 -short of the present moment. Decision D9.                     
+      103 +payload never re-asserts state, so a webhook lost to a network
+          + failure leaves a                                             
+      104 +record wrong until somebody edits that field again. The same q
+          +uery covers a lost                                            
+      105 +webhook and a six-hour outage, at 2 calls a minute out of 4,80
+          +0, which is 0.04                                              
+      106 +per cent. The cost is the per-object floor and not the record 
+          +volume, so polling                                            
+      107 +more often is close to free; one minute is chosen for repair t
+          +ime. Because the                                              
+      108 +lag between a commit and its visibility to a query is undocume
+          +nted (claim C26),                                             
+      109 +each window overlaps the last generously. Decision D9.        
+      110  
+      111  *If wrong:* a visibility lag longer than the overlap loses cha
+           nges silently,
+     … 190 more lines (ctrl+o to expand)
+
+● Bash(python - <<'PYEOF'
+      import io…)
+  ⎿  Updated docs\design.md (+2 -2)
+      309     one is retrieved from Salesforce, and its external ID eithe
+           r binds it to an
+      310     existing portal record or shows it to be new (A11).
+      311  3. Take the record's row lock, the same lock a portal save tak
+           es (A10).
+      312 -4. Apply the loop rule (section 9). An echo of our own write s
+          -tops here, after                                              
+      313 -   the binding in step 2 has been kept.                       
+      312 +4. Apply the loop rule (section 9), which drops the fields tha
+          +t match what we                                               
+      313 +   sent and keeps the rest. The binding from step 2 is kept ei
+          +ther way.                                                     
+      314  5. For each changed field, apply the conflict rule (section 7)
+           , write
+      315     `field_history`, update `field_value` when the change wins,
+            and update
+      316     `salesforce_shadow` either way, since the shadow is what Sa
+           lesforce holds and
+
+● Bash(git add -A && git commit -q -F - <<'COMMITEOF'
+      Decide echoes by field comparison, dedupe on eventId, and drain in two
+      lanes…)
+  ⎿  (No output)
+
+● Now the builder check with a fresh agent that has none of our context.
+
+● Agent(Builder check on design.md)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● All three bugs were real. Fixes committed as 9a43b40, and the builder check is
+  running now.
+
+  The loop rule bug was the worst of the three
+
+  - You are right, and the source backs you: Salesforce's own admin blog says
+    all flows except scheduled ones run as the current user, and that the
+    current user is recorded as the last modifier on a flow's writes.
+  - So our write and any flow it sets off both come back stamped with our
+    integration user. The old rule would have dropped the automation result and
+    raised no error anywhere, which is the failure mode this whole design is
+    meant to avoid.
+  - The fix is in: identity marks an event a likely echo, then each changed
+    field is compared against what we sent. Matching fields are dropped,
+    differing ones applied as genuine changes, so a reformatted phone number or
+    a status a flow set reaches the portal.
+  - D20 supersedes D5. D5's status line is the only thing that moved on it.
+  - Apex triggers I could not settle. One third-party source says they run as
+    the Automated Process user, which contradicts the common understanding that
+    attribution stays with the user who made the write. Recorded as claim C30,
+    Not determined, with Q22 asking the client what automation runs on Contact
+    and Account and under which user.
+
+  Source: Salesforce admin blog on the flow running user
+  (https://admin.salesforce.com/blog/2022/your-guide-to-determining-the-flow-run
+  ning-user-and-its-execution-context), through a search result, since the
+  domain still refuses direct fetches.
+
+  The other two
+
+  - eventId is in the brief's sample, carrying evt_1001. I missed it when
+    reading the payload. It is now the deduplication key with a unique index,
+    and the composite key is the fallback for an event that arrives without one,
+    with the share of events taking the fallback counted. Your point about the
+    lost actor is the reason: the composite key collapsed two separate edits
+    setting the same value in the same second, and the brief counts a lost actor
+    as a lost change.
+  - The two lanes are in. Live first up to its 10 a second, backlog takes the
+    rest of the 80, split by whether the edit was made during the outage or
+    after recovery began. The 60-second alarm watches the live lane only. The
+    backlog's expected drain time is now a reported number without being an
+    alarm, next to the too-close-to-call counter.
+  - I had written the arithmetic correctly and never said what enforces it,
+    which is the kind of gap that survives review because the numbers look
+    right.
+
+  Small ones
+
+  - Section 2 has an ASCII diagram of the boundary: Salesforce above, the
+    endpoint and worker in one unit, Postgres below, the portal under that, with
+    the four REST calls labelled on the upward arrow.
+  - Section 12 now says a program is optional, which is what the brief says, and
+    names the three cases the brief wants exercised: a duplicate, an older
+    event after a newer one, and a restart with the fake down.
+  - One trim pass on section 1, as agreed, no more cutting turns. The document
+    is 5,740 words now: the diagram, the longer loop-rule section and three more
+    appendix claims outweighed the trim.
+
+  Three new decisions logged, D20 to D22, plus Q21 on whether eventId survives a
+  redelivery unchanged and Q22 on the org's automation. Every cross-reference
+  still resolves: 31 claims, no dangling D, Q, A or C number, and no reference
+  to D5 left in the design.
+
+  I will bring you the builder's questions sorted into the three piles, with
+  only yours to answer.
+
+› Message from general-purpose
+  Read `c:\Users\dell\Documents\tequinty\docs\design.md` in full. It is
+  unusually complete — the conflict rule, dedupe, loop rule, outage arithmetic
+  and failure handling are all decided, and I could start on tables,
+  inbox/outbox and the worker from it. What follows is only what I'd have to
+  guess at, ranked by how much a wrong guess costs.
+
+  **1. Who builds the Salesforce-side webhook, and what exactly does it emit?**
+  The whole inbound path rests on a sender that does not exist yet. Section 2
+  says "we never run code inside Salesforce", and lists signing the payload as
+  something the client changes on their side. But C20, C27 and C31 all say the
+  webhook is custom, so somebody has to write the Apex/Flow that emits
+  `eventId`, `occurredAt`, `changedBy` and `changedFields` and signs the body.
+  The questions: is that in my scope or the client's, is there an existing
+  sender already in production, and does it fire on every change — API writes,
+  bulk loads, flow and trigger writes, mass owner reassignment — or only on UI
+  edits? Also its retry behaviour: at-least-once with a stable `eventId` across
+  redeliveries (Q21), or a fresh one each time.
+  *Why it changes the plan:* if it is mine, it is a second codebase in a
+  language and org I have no access to, and probably the longest pole. If it
+  only fires on UI edits, the catch-up poll stops being a safety net and becomes
+  the primary inbound path, which inverts the build order in section 3. If
+  `eventId` changes on redelivery, section 8's dedupe degrades to the weak
+  composite key for every retry rather than for rare events.
+
+  **2. Does our own write come back as a webhook or not? The document says
+  both.**
+  Section 2 requires the integration user created "with outbound webhook sending
+  switched off for its profile". Section 9 builds a two-step loop rule
+  precisely because our write *does* come back, and argues that dropping on
+  identity alone would silently lose automation results. Those cannot both hold:
+  if sending is suppressed for that profile, the flow-triggered changes section
+  9 exists to catch are suppressed with it, because C29 says the flow's writes
+  carry our user too.
+  *Why it changes the plan:* it decides whether the `salesforce_shadow`
+  field-comparison path is built at all, and whether automation results reach us
+  by webhook or only via the minute poll. If suppression stays, the poll has to
+  be treated as the only channel for post-write automation and its overlap and
+  cost assumptions change.
+
+  **3. What is the 100-calls-a-second cap actually a cap on?**
+  The whole operating point (80/sec sustained, 70/sec drain, 26-minute recovery)
+  assumes a per-second ceiling with no other limit behind it. 80/sec held for a
+  day is ~6.9M calls. Real orgs also have a 24-hour allocation and a
+  concurrency limit on long-running requests. Is the 100 a brief-supplied
+  simplification, or the org's real published limit, and is there a daily
+  allocation and what is already consumed by other integrations?
+  *Why it changes the plan:* if a daily allocation binds, the 1-minute poll
+  (2,880 calls/day), the drain, and any backfill all have to be budgeted against
+  it together, and the drain may have to be throttled below 70/sec — which
+  moves the 26 minutes and the alarm threshold in section 11.
+
+  **4. How does the `owner` field map across the two systems?**
+  Owner is one of the nine in-scope fields on both objects, and it is the only
+  one whose value is an identity rather than a scalar. The document never says
+  how a Salesforce `OwnerId` becomes a portal user or back. A12 also requires
+  the conflict message to "name a Salesforce user", which needs the same
+  mapping. Questions: is there a table of portal user ↔ Salesforce User, what
+  happens on a portal save when the chosen owner has no Salesforce User, what
+  happens inbound when a Salesforce owner has no portal account, and are
+  inactive users or queues valid owners.
+  *Why it changes the plan:* a user-mapping table, its sync, and its failure
+  modes are a work item the document does not have, and the conflict rule needs
+  translation before comparison, not just a value copy. A wrong guess also means
+  outbound writes fail with a 4xx and park, hitting the parked-count alarm.
+
+  **5. How much of the existing portal do I change, and does its data migrate?**
+  The design has the portal reading and writing this Postgres directly (section
+  2), taking a per-record row lock, drawing a sequence under it, carrying
+  per-field versions in its forms, refusing stale saves with a who-changed-what
+  message, and showing an out-of-step badge. That is real work inside someone
+  else's application. Questions: is the portal's codebase mine to change, is it
+  the same database or a separate one, and does it already store customers and
+  contacts record-level (so these rows need a migration into
+  `record`/`field_value`/`field_history` with a cutover) or is this greenfield?
+  *Why it changes the plan:* portal changes plus a live data migration could be
+  larger than the sync worker itself, and section 3's build order says nothing
+  about either. If the portal is a separate service on a separate database,
+  A14's "talking only through Postgres tables" does not hold and the whole
+  boundary is redrawn.
+
+  **6. When an inbound change loses the conflict, does anything push our winner
+  back to Salesforce?**
+  Section 5 step 5 updates the shadow "either way, since the shadow is what
+  Salesforce holds and not what we chose" — so after a losing inbound change we
+  knowingly hold a different value than Salesforce, with no outbox row. Section
+  10 states the opposite-direction rule firmly ("changes applied by catch-up
+  never enter the outbound queue"), and section 7 only covers two portal users.
+  So: does a Salesforce change that loses on timestamp trigger a corrective
+  outbound write, or do the sides stay divergent until the next edit touches
+  that field?
+  *Why it changes the plan:* without a corrective write, the system does not
+  converge, and the "out of step" flag in `record` would need to cover this case
+  too. With one, there is a re-entrancy risk — the corrective write echoes back
+  — that the loop rule has to be checked against. It is a few hours of code
+  either way, but it is a behaviour I must not guess at.
+
+  **7. Can the client actually make the four org changes, and by when? (Q4,
+  Q15)**
+  The document flags field history tracking (C10/Q4) and the external ID field
+  (C25/Q15) as assumptions, and A4 calls tracking "the assumption that matters
+  most in the whole document". For planning I need the answer, not the flag:
+  tracking on for all nine fields today, retroactively? An External ID + Unique
+  custom field approved on Contact and Account? And how long client-side config
+  changes take to land.
+  *Why it changes the plan:* each has a stated fallback that is a materially
+  different build — no external ID means claim rows plus a reconciliation query
+  instead of upsert; no tracking means synthetic history entries and dropping
+  the 243-call history path entirely. I cannot sequence section 3 without
+  knowing which branch I am on, and these are long-lead client approvals.
+
+  **8. What do I get to develop against?**
+  No sandbox, credentials, API version, or auth flow is named. C24 makes the API
+  version load-bearing on response parsing (204 empty vs 200 with a `created`
+  flag). Also needed: the API names and types of the nine fields, whether
+  "customer" really is Account (C11 is an assumption), and whether Person
+  Accounts are enabled — they would change the Contact model.
+  *Why it changes the plan:* no sandbox means everything is built against the
+  fake Salesforce and the real-org risk lands late, which changes how I stage
+  and estimate verification. Person Accounts in particular would break the
+  contact-belongs-to-customer field.
+
+  **9. Is the initial load of 5 million records in scope? (Q10)**
+  The document leaves this open and I cannot close it myself. If it is in, it is
+  a workstream with its own throttle, its own matching rules for records that
+  already exist on both sides with no shared key, and a watermark handoff.
+  *Why it changes the plan:* it roughly doubles the project and it competes for
+  the same 100 calls a second, so it also changes the operating point in A1.
+
+  **10. What should happen when a record is deleted in Salesforce?**
+  Deletes are out of scope (section 12), but the outbound path is an upsert
+  keyed on external ID. Any later portal edit to a record deleted in Salesforce
+  silently recreates it. Is that acceptable for now, or does out-of-scope mean
+  the record should park?
+  *Why it changes the plan:* small code either way, but it is a data-correctness
+  behaviour that would be found in production rather than review, and the
+  catch-up poll will not see deletes at all.
+
+  **Scoping note, not a question for the author:** section 12 says code is out
+  of scope and calls this "this weekend's work", and mentions a fake Salesforce
+  as the test target. Before planning I need to know from whoever commissioned
+  the plan whether the target is the production integration or the exercise's
+  demonstration program against the fake — the answers to 5, 8 and 9 above only
+  matter for the former.
+
+● The builder came back with ten questions. Sorting them now, and settling the
+  ones I can.
+
+  Made 1 scratchpad edit +139 (ctrl+o to expand)
+
+● Agent "Builder check on design.md" finished · 1m 43s
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/builder_fixes.py" && git add -A &&
+      git commit -…)
+  ⎿  Updated docs\decisions.md (+67 -0)
+      1077  be watched and the operating point raised toward the cap.
+      1078  
+      1079  
+      1080 +---                                                          
+      1081 +                                                             
+      1082 +## D23. Outbound sending stays on for the integration user   
+      1083 +                                                             
+      1084 +**Status:** agreed                                           
+      1085 +                                                             
+      1086 +**Raised by:** A builder reading the design cold, who found s
+           +ection 2 and                                                 
+      1087 +section 9 contradicting each other.                          
+      1088 +                                                             
+      1089 +**Problem:** Section 2 listed "outbound webhook sending switc
+           +hed off for the                                              
+      1090 +integration user's profile" among the changes the client make
+           +s, which is the                                              
+      1091 +common way to stop an echo. Section 9 relies on our write com
+           +ing back, because a                                          
+      1092 +flow fired by our write carries our integration user too (cla
+           +im C29), and the                                             
+      1093 +field comparison is what separates the echo from the automati
+           +on result.                                                   
+      1094 +Suppressing the profile's events would suppress the automatio
+           +n results with                                               
+      1095 +them, and they would only ever reach us through the minute po
+           +ll.                                                          
+      1096 +                                                             
+      1097 +**Options, and why they lost:**                              
+      1098 +                                                             
+      1099 +- **Suppress and rely on the poll for automation results.** R
+           +ejected: it turns                                            
+      1100 +  the safety net into the primary channel for a whole class o
+           +f change, and                                                
+      1101 +  delays it by up to two poll intervals when webhooks exist t
+           +hat would have                                               
+      1102 +  carried it in seconds.                                     
+      1103 +                                                             
+      1104 +**Decision:** Sending stays on for the integration user. The 
+           +echo is removed by                                           
+      1105 +the field comparison in D20, which has to exist anyway. Only 
+           +the filtering half                                           
+      1106 +of the common practice in claim C19 is used.                 
+      1107 +                                                             
+      1108 +**Pushback:** the builder found the contradiction. The AI had
+           + written both lines                                          
+      1109 +and not noticed they could not both hold.                    
+      1110 +                                                             
+      1111 +**If wrong:** if the volume of echoes costs too much inbound 
+           +work, the profile                                            
+      1112 +can be suppressed later, and the poll then has to carry autom
+           +ation results with                                           
+      1113 +a tighter interval.                                          
+      1114 +                                                             
+      1115 +---                                                          
+      1116 +                                                             
+     … 39 more lines (ctrl+o to expand)
+  ⎿  Updated docs\design.md (+19 -5)
+      239  ```
+      240  
+      241  Salesforce never reads our database, and we never run code ins
+           ide Salesforce.
+      242 -Four things have to change on the client's side before any of 
+          -this works: field                                             
+      242 +The webhook sender is the client's. The brief hands it to us a
+          +s something that                                              
+      243 +exists, and section 2's boundary holds because we never run co
+          +de in their org.                                              
+      244 +Whether it fires on every change or only on edits made in the 
+          +Salesforce                                                    
+      245 +interface is question Q23, and the answer decides whether the 
+          +poll is a safety                                              
+      246 +net or the main inbound path.                                 
+      247 +                                                              
+      248 +Three things have to change on the client's side before any of
+          + this works: field                                            
+      249  history tracking switched on for the nine fields, a custom fie
+           ld marked External
+      244 -ID and Unique added to Contact and Account, an integration use
+          -r created with                                                
+      245 -outbound webhook sending switched off for its profile, and the
+          - webhook                                                      
+      246 -configured to sign its payload.                               
+      250 +ID and Unique added to Contact and Account, and an integration
+          + user created,                                                
+      251 +with its payload signed.                                      
+      252 +                                                              
+      253 +Outbound sending stays **on** for that integration user. Suppr
+          +essing it is the                                              
+      254 +usual way to stop an echo, and it would also suppress the auto
+          +mation results the                                            
+      255 +loop rule exists to keep (section 9). The echo is removed by c
+          +omparison instead.                                            
+      256 +Decision D23.                                                 
+      257 +                                                              
+      258 +The portal is Tequity's own, so the changes it needs, per-fiel
+          +d versions in the                                             
+      259 +forms, the row lock and the out-of-step marker, are ours to ma
+          +ke.                                                           
+      260  
+      261  ## 3. The subproblems, in the order to build them
+      262  
+     ...
+      354  | Response | What happens |
+      355  |---|---|
+      356  | 2xx | Update the shadow from the response, mark the outbox r
+           ow done. 201 means the record was created, so the returned Sal
+           esforce ID is stored. |
+      357 +| 201 on a record that already held a `salesforce_id` | The re
+          +cord was deleted in Salesforce. Store the new ID, mark the rec
+          +ord out of step, and park it for a person. Deletes are out of 
+          +scope and the poll never sees them (D24). |                   
+      358  | 412 | Salesforce changed first. Re-read the record, apply th
+           e conflict rule per field, send what still wins. Costs three c
+           alls, which the drain arithmetic allows for. |
+      359  | 403 with `REQUEST_LIMIT_EXCEEDED` | Slow down. The backoff t
+           ime is written to `sync_state` and every worker thread honours
+            it. The row stays queued. |
+      360  | 5xx, a timeout, or a connection failure | Retry with exponen
+           tial backoff and jitter. The row stays queued, which is the si
+           x-hour outage case. |
+     ...
+      578  | C16 | An HTTP-date carries one-second resolution, so two edi
+           ts in the same second are indistinguishable to the check | Ass
+           umption, from the HTTP specification |
+      579  | C17 | Which timestamp the check compares against: Salesforce
+            says "last modified date" and names no field | Not determined
+            |
+      580  | C18 | Salesforce attributes a change to the user whose crede
+           ntials made the API call | Verified |
+      567 -| C19 | Filtering inbound events on the integration user's ide
+          -ntity, and switching off outbound sending for that profile, is
+          - common integration practice | Verified as practice |         
+      581 +| C19 | Filtering inbound events on the integration user's ide
+          +ntity, and switching off outbound sending for that profile, is
+          + common integration practice. Only the filtering half is used 
+          +here; see D23 | Verified as practice |                        
+     … 3 more lines (ctrl+o to expand)
+
+● The builder check is back. Sorted, and here is only your pile.
+
+  Two questions only you can answer
+
+  1. The owner field, which is the one field whose value is a person
+
+  - Owner is one of the nine in-scope fields on both objects, and it is the only
+    one that holds an identity and not a value.
+  - The document never says how a Salesforce OwnerId becomes a portal user, or
+    back. Without that, an owner change cannot be applied inbound or sent
+    outbound at all.
+  - It also has consequences the rest of the design already depends on. The
+    stale-save message in A12 has to name a Salesforce user, which needs the
+    same mapping. An owner we cannot translate produces a 4xx on the write,
+    which parks the edit and pushes the parked-count alarm.
+  - What I would do: a user_map table of portal user to Salesforce User ID,
+    maintained by hand for now since the brief says nothing about provisioning.
+    An inbound owner with no portal counterpart is stored as the raw Salesforce
+    ID and shown as an unknown user, because refusing it would lose a genuine
+    change. An outbound owner with no Salesforce counterpart is refused at save
+    time, before an outbox row exists, since that one we can catch early.
+  - What I need from you: whether the mapping table is in scope this weekend or
+    whether owner is treated as an opaque value that passes through
+    untranslated. Treating it as opaque is cheaper and leaves the portal showing
+    a Salesforce ID where a name should be.
+
+  2. What happens to a pending portal edit when an inbound Salesforce change
+  wins that field
+
+  - Section 5 applies the conflict rule per field and section 10 says catch-up
+    results never enter the outbound queue. Neither says what happens to an
+    outbox row that is already waiting for a field the inbound change just won.
+  - Three cases, and the third is the one that needs you.
+    - Our write already succeeded and a stale webhook arrives after it: the
+      webhook loses, Salesforce already holds our value, nothing to do.
+    - Our edit is still queued and wins on timestamp: it stays queued and goes
+      out, which is correct.
+    - Our edit is still queued and loses: Salesforce holds the winning value,
+      our row would overwrite it with a value we have already agreed is stale.
+  - What I would do: drop the outbox row for that field when the inbound change
+    wins, and record the drop in history so the finance user can see their edit
+    lost and to what. The alternative, sending it anyway, would be overwritten
+    by nothing and would leave the two sides disagreeing with our own conflict
+    rule.
+  - The reason it is yours: dropping a queued edit is the system discarding a
+    person's work without them asking. You ruled on exactly this in D12 when you
+    chose parking over rolling back, and I want the same call made deliberately
+    rather than inferred from it.
+
+  Calls I made, so you can check them while reading
+
+  - Outbound sending stays on for the integration user. The builder found
+    section 2 and section 9 contradicting each other: section 2 had the client
+    suppress the integration user's events, which is the standard echo defence,
+    while section 9 needs those events to catch automation results. Suppression
+    would have deleted the reason D20 exists. Logged as D23, and the appendix
+    claim about the common practice now says only the filtering half is used.
+  - A 201 on a record that already had a Salesforce ID is parked. Deletes are
+    out of scope and every write is an upsert, so a record deleted in Salesforce
+    would be quietly recreated by the next portal edit, and the poll never sees
+    deletes. The 201 is already distinguished from an update's response, so
+    this costs nothing. Logged as D24.
+  - Four client questions added, Q23 to Q26: whether the webhook fires on every
+    change or only on edits made in the Salesforce interface, whether a 24-hour
+    API allocation binds behind the per-second cap, whether Person Accounts are
+    enabled, and the owner mapping above. Q23 is the sharpest of them: if the
+    webhook covers interface edits only, the minute poll stops being a safety
+    net and becomes the main inbound path, which inverts the build order.
+  - Said plainly who builds what. Section 2 now states that the webhook sender
+    is the client's, which the brief hands us as existing, and that the portal
+    is Tequity's own so its changes are ours to make.
+
+  Everything else the builder raised was already answered in the document or in
+  the decision log: the client's org changes are Q4 and Q15, the initial load is
+  Q10 and section 12, the API version is Q18, and sandbox access and
+  credentials are below the line for a design. The document is 5,920 words.
+
+> owner. in scope, your way. user_map table, filled by hand for now, syncing it
+  is out of scope. unknown owner inbound stored as the raw salesforce id so
+  nothing is lost, unknown owner outbound refused at save before any outbox row
+
+  queued edit that loses. drop it, but only the losing field, the other fields
+  in that row still go. section 7 already picked the winner, sending the loser
+  after would break our own rule. this is not the D12 case, there salesforce
+  rejected by its rule, here our rule chose by time. history marks it
+  superseded and the user gets the same note as any lost conflict
+
+  your calls D23 D24 and Q23 are good, keep them
+
+  last pass. design.md is 5900 and growing, bring it to about 5000 without
+  losing a fact, number or D/Q pointer. then use
+  /superpowers:verification-before-completion for the final check: all 12
+  sections there, every number the same everywhere it shows up, specially 26
+  min and the lane split after the two lane change, every D and Q pointer
+  resolves, no placeholder text. show me the proof, then commit
+
+  Made 1 scratchpad edit +91 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/add_d25_26.py" && git add
+      docs/decisions.md &&…)
+  ⎿  Updated docs\decisions.md (+71 -1)
+      1140  side a delete propagates to.
+      1141  
+      1142  
+      1143 +---                                                          
+      1144 +                                                             
+      1145 +## D25. Owner is translated through a hand-filled user map   
+      1146 +                                                             
+      1147 +**Status:** agreed                                           
+      1148 +                                                             
+      1149 +**Raised by:** A builder reading the design cold, who found o
+           +wner to be the only                                          
+      1150 +one of the nine fields whose value is a person and not a valu
+           +e.                                                           
+      1151 +                                                             
+      1152 +**Problem:** A Salesforce `OwnerId` means nothing to the port
+           +al and a portal                                              
+      1153 +user means nothing to Salesforce. Without a translation an ow
+           +ner change cannot                                            
+      1154 +be applied inbound or sent outbound, and the stale-save messa
+           +ge in A12 cannot                                             
+      1155 +name the person who changed a field.                         
+      1156 +                                                             
+      1157 +**Options, and why they lost:**                              
+      1158 +                                                             
+      1159 +- **Treat owner as an opaque value that passes through untran
+           +slated.**                                                    
+      1160 +  Rejected: the portal would show a Salesforce ID where a nam
+           +e belongs, and the                                           
+      1161 +  brief asks who changed what.                               
+      1162 +                                                             
+      1163 +**Decision:** A `user_map` table of portal user to Salesforce
+           + User ID, filled by                                          
+      1164 +hand. Keeping it in step with either system's user list is ou
+           +t of scope. An                                               
+      1165 +inbound owner with no portal counterpart is stored as the raw
+           + Salesforce ID, so                                           
+      1166 +nothing is lost and the change still applies. An outbound own
+           +er with no                                                   
+      1167 +Salesforce counterpart is refused at save time, before an out
+           +box row exists,                                              
+      1168 +because that one can be caught early.                        
+      1169 +                                                             
+      1170 +**Pushback:** none. Abhishek took the AI's proposal and confi
+           +rmed the asymmetry                                           
+      1171 +between the two unknown-user cases, which is deliberate: inbo
+           +und keeps the                                                
+      1172 +change, outbound refuses it.                                 
+      1173 +                                                             
+      1174 +**If wrong:** if the client provisions users often, the hand-
+           +filled table goes                                            
+      1175 +stale and owner changes start parking, at which point the map
+           + has to be                                                   
+      1176 +populated from a Salesforce user query.                      
+      1177 +                                                             
+      1178 +---                                                          
+      1179 +                                                             
+     … 44 more lines (ctrl+o to expand)
+
+● Bash(cp docs/design.md "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f8
+      01/615a1f11-e04b-403b-bd09-bc2be0747dc6/scratchpad/design_before_trim.md"
+      && sed -n '/^…)
+  ⎿  (No output)
+
+● Now the design edits: the two new rules in, then a compression pass across the
+  whole document.
+
+  Made 1 scratchpad edit +459 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/final_pass.py")
+  ⎿  1 file changed (binary, mode only or too large to show)
+
+  Made 1 scratchpad edit +94 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/dedupe_pass.py")
+  ⎿  Updated docs\design.md (+24 -27)
+      57  unrecoverable, and the design has to state a maximum tolerable 
+          outage.
+      58  
+      59  **A4. Field history for the outage window comes from ContactHis
+          tory and
+      60 -AccountHistory, and tracking is switched on.** A catch-up query
+         - returns current                                               
+      61 -values only, so a phone number changed three times during the o
+         -utage comes back                                               
+      62 -as one number, which the brief counts as losing a change. Track
+         -ing is off by                                                  
+      63 -default, per field, so this is the document's biggest assumptio
+         -n. Decision D2,                                                
+      64 -claims C5 to C11.                                              
+      60 +AccountHistory, and tracking is switched on.** A phone number c
+         +hanged three                                                   
+      61 +times during the outage comes back from the catch-up query as o
+         +ne number, which                                               
+      62 +the brief counts as losing a change. Tracking is off by default
+         +, per field, so                                                
+      63 +this is the document's biggest assumption. Decision D2, claims 
+         +C5 to C11.                                                     
+      64  
+      65  *If wrong:* with tracking off, the window's intermediate values
+           are unrecoverable
+      66  by any API, and catch-up records one synthetic history entry pe
+          r changed field
+     ...
+      76  lock for the duration of the call.
+      77  
+      78  **A6. Our own write comes back identified as our integration us
+          er, and so does
+      80 -any automation it sets off.** A record-triggered flow runs as t
+         -he user who made                                               
+      81 -the edit, so identity alone cannot separate our echo from a cha
+         -nge the org made                                               
+      82 -afterwards. Identity marks an event a likely echo; comparing ag
+         -ainst what we                                                  
+      83 -sent decides, field by field. Decision D20, claims C18 to C20 a
+         -nd C29 to C30.                                                 
+      79 +any automation it sets off**, because a record-triggered flow r
+         +uns as the user                                                
+      80 +who made the edit. Identity alone therefore cannot separate our
+         + echo from a                                                   
+      81 +change the org made afterwards: it marks an event a likely echo
+         +, and comparing                                                
+      82 +against what we sent decides, field by field. Section 9 has the
+         + rule. Decision                                                
+      83 +D20, claims C18 to C20 and C29 to C30.                         
+      84  
+      85  *If wrong:* if this org's automation runs under a different use
+          r, identity alone
+      86  would have been enough and this rule gives the same answer anyw
+          ay.
+     ...
+      89  
+      90  **A7. A webhook carries only the fields that changed.** The bri
+          ef's one sample
+      91  carries a `changedFields` object, the only evidence available. 
+          An adapter
+      92 -normalises every payload into a list of field changes, each wit
+         -h field name,                                                  
+      93 -value, time and actor; a whole record becomes that list by comp
+         -aring it against                                               
+      94 -the shadow copy. A field **absent** means unchanged, a field **
+         -present and                                                    
+      95 -null** means cleared. Decision D8.                             
+      92 +normalises every payload into a list of field changes (section 
+         +5), and a whole                                                
+      93 +record becomes that list by comparing it against the shadow cop
+         +y. A field                                                     
+      94 +**absent** means unchanged, a field **present and null** means 
+         +cleared.                                                       
+     … 47 more lines (ctrl+o to expand)
+
+  Made 1 scratchpad edit +64 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/appendix_pass.py")
+  ⎿  Updated docs\design.md (+16 -16)
+      555  
+      556  | # | Claim | Label |
+      557  |---|---|---|
+      558 -| C1 | SystemModstamp is read-only, always equal to or later t
+          -han LastModifiedDate, moves when automated processes touch a r
+          -ecord, and is indexed | Verified |                            
+      558 +| C1 | SystemModstamp is read-only, always equal to or later t
+          +han LastModifiedDate, moves when automation touches a record, 
+          +and is indexed | Verified |                                   
+      559  | C2 | LastModifiedDate can be back-dated during a migration a
+           nd is not indexed, so it is unsafe for ordering | Verified |
+      560 -| C3 | A query response returns at most 2,000 records, adjusta
+          -ble between 200 and 2,000 with `Sforce-Query-Options: batchSiz
+          -e`, with no guarantee the size is honoured | Verified |       
+      560 +| C3 | A query response returns at most 2,000 records, adjusta
+          +ble between 200 and 2,000 with `Sforce-Query-Options: batchSiz
+          +e`, the size not guaranteed | Verified |                      
+      561  | C4 | A SOQL filter on SystemModstamp has no lookback limit |
+            Assumption |
+      562 -| C5 | ContactHistory is queryable with ContactId, Field, OldV
+          -alue, NewValue, CreatedById and CreatedDate | Verified |      
+      563 -| C6 | A record creation writes a history row with Field set t
+          -o "created" and empty values | Verified |                     
+      562 +| C5 | ContactHistory is queryable with ContactId, Field, OldV
+          +alue, NewValue, CreatedById, CreatedDate | Verified |         
+      563 +| C6 | A creation writes a history row with Field set to "crea
+          +ted" and empty values | Verified |                            
+      564  | C7 | OldValue and NewValue cannot be filtered on in SOQL; fi
+           ltering is by record and date | Verified |
+      565 -| C8 | Standard tracking covers up to 20 fields per object, wi
+          -th retention up to 18 months and 24 through the API, without S
+          -hield | Verified |                                            
+      566 -| C9 | Long text, rich text, formula, roll-up summary and auto
+          --number fields cannot be tracked, and none of the nine fields 
+          -is one of those | Verified |                                  
+      567 -| C10 | Tracking is switched on for these fields in the client
+          -'s org; it is off by default, per field | Assumption, question
+          - Q4 |                                                         
+      565 +| C8 | Tracking covers up to 20 fields per object, retained 18
+          + months, 24 through the API, without Shield | Verified |      
+      566 +| C9 | Long text, rich text, formula, roll-up summary and auto
+          +-number fields cannot be tracked; none of the nine is one | Ve
+          +rified |                                                      
+      567 +| C10 | Tracking is on for these fields in the client's org; i
+          +t is off by default, per field | Assumption, question Q4 |    
+      568  | C11 | The brief's "customer" maps to the Salesforce Account 
+           object | Assumption |
+      569 -| C12 | The REST API supports `If-Unmodified-Since`, which Sal
+          -esforce calls a weak validator comparing against the record's 
+          -last modified date | Verified |                               
+      569 +| C12 | The REST API supports `If-Unmodified-Since`, which Sal
+          +esforce calls a weak validator against the record's last modif
+          +ied date | Verified |                                         
+      570  | C13 | A failed precondition on PATCH returns 412; a malforme
+           d header value returns 400 | Verified |
+      571 -| C14 | The strong validator, an ETag with `If-Match`, is retu
+          -rned for Account records only | Verified |                    
+      571 +| C14 | The strong validator, an ETag with `If-Match`, is retu
+          +rned for Account only | Verified |                            
+      572  | C15 | `If-Unmodified-Since` applies to Contact updates | Ass
+           umption, from the supported-resource list |
+      573  | C16 | An HTTP-date carries one-second resolution, so two edi
+           ts in the same second are indistinguishable to the check | Ass
+           umption, from the HTTP specification |
+      574  | C17 | Which timestamp the check compares against: Salesforce
+            says "last modified date" and names no field | Not determined
+            |
+      575  | C18 | Salesforce attributes a change to the user whose crede
+           ntials made the API call | Verified |
+      576 -| C19 | Filtering inbound events on the integration user's ide
+          -ntity, and switching off outbound sending for that profile, is
+          - common integration practice. Only the filtering half is used 
+          -here; see D23 | Verified as practice |                        
+      577 -| C20 | The client's webhook populates `changedBy` from the re
+          -cord's last modifier on every event | Assumption, the webhook 
+          -is custom |                                                   
+      576 +| C19 | Filtering inbound events on the integration user's ide
+          +ntity, and suppressing that profile's outbound events, is comm
+          +on practice. Only the filtering half is used, per D23 | Verifi
+          +ed as practice |                                              
+      577 +| C20 | The webhook populates `changedBy` from the record's la
+          +st modifier on every event | Assumption, the webhook is custom
+          + |                                                            
+      578  | C21 | The REST API upserts on a custom external ID field, an
+           swering 201 when it created a record | Verified |
+      579  | C22 | An external ID value matching more than one record ans
+           wers 300 and writes nothing | Verified |
+      580 -| C23 | A field marked External ID and Unique acts as a unique
+          - index and blocks duplicates; without Unique the caller needs 
+          -View All Data | Verified |                                    
+      581 -| C24 | An update answers 204 with no body on API version 45.0
+          - and earlier, and 200 with a body carrying a `created` flag fr
+          -om 46.0 | Verified, question Q18 |                            
+      580 +| C23 | External ID plus Unique acts as a unique index and blo
+          +cks duplicates; without Unique the caller needs View All Data 
+          +| Verified |                                                  
+      581 +| C24 | An update answers 204 with no body on API version 45.0
+          + and earlier, 200 with a `created` flag from 46.0 | Verified, 
+          +question Q18 |                                                
+     … 10 more lines (ctrl+o to expand)
+● Skill(superpowers:verification-before-completion)
+  ⎿  Successfully loaded skill
+
+  Made 1 scratchpad edit +136 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/verify.py"; echo "EXIT=$?")
+  ⎿  (No output)
+
+● Several failures. Checking which are real.
+
+● Bash(echo "--- 2,880 in git history ---" && git log --oneline -S"2,880" --
+      docs/design.md && echo "--- current poll cost text ---" && grep -n -A3 "2
+      calls a minute"…)
+  ⎿  (No output)
+
+● Bash(python - <<'PYEOF'
+      import io…)
+  ⎿  Updated docs\design.md (+4 -3)
+      101  **A8. The catch-up query runs every minute, all the time.** A 
+           changed-fields
+      102  payload never re-asserts state, so a lost webhook leaves a rec
+           ord wrong until
+      103  somebody edits that field again. The same query covers a lost 
+           webhook and a
+      104 -six-hour outage, at 2 calls a minute out of 4,800, which is 0.
+          -04 per cent. The                                              
+      105 -cost is the per-object floor and not the record volume, so pol
+          -ling more often is                                            
+      106 -close to free; one minute is chosen for repair time. Because t
+          -he lag between a                                              
+      104 +six-hour outage, at 2 calls a minute out of 4,800, which is 0.
+          +04 per cent, and                                              
+      105 +about 2,880 calls a day. The cost is the per-object floor and 
+          +not the record                                                
+      106 +volume, so polling more often is close to free; one minute is 
+          +chosen for repair                                             
+      107 +time. Because the lag between a                               
+      108  commit and its visibility to a query is undocumented (claim C2
+           6), each window
+      109  overlaps the last generously. Decision D9.
+      110  
+
+● Bash(python - <<'PYEOF' > "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c02
+      3f801/615a1f11-e04b-403b-bd09-bc2be0747dc6/scratchpad/verify2.py"
+      import io…)
+  ⎿  (No output)
+
+● Bash(git add -A && git commit -q -F - <<'COMMITEOF'
+      Translate owner in the outbound path, drop a losing field from a queued
+      row, and compress…)
+  ⎿  (No output)
+
+● Both your calls are in, logged as D25 and D26 and committed on their own
+  before the document changed. The final pass is committed as b8abc6d.
+
+  The verification, in full
+
+  - 12 sections present and in order, appendix present, no placeholder text
+    anywhere.
+  - No number lost against the pre-trim file: the numeric-token diff came back
+    empty.
+  - 36 load-bearing numbers checked individually for presence where they belong,
+    including about 26 minutes in both places it appears, 108,000, 70
+    requests/sec, 80 - 10 live, 1,543 seconds, 324,000, 486,000, 243 calls, 405
+    calls, 103 minutes, 3.5 minutes, 0.000012, 0.43, 0.07, 36,000, 14 requests
+    in flight, 35 at 500ms, 4,800, 0.04 per cent, 18 months, 20 fields, 45.0 and
+    46.0.
+  - Lane split consistent across sections 10 and 11: two lanes, live lane first
+    at its 10 requests a second, backlog taking whatever is left of the 80, the
+    alarm watching the oldest pending row in the live lane only, and the backlog
+    lane's expected drain time reported without being an alarm. The drain
+    arithmetic still reads 80 - 10 live = 70.
+  - The only "about N minutes" figures in the document are 26 and 54, so nothing
+    contradicts the drain time.
+  - Pointers all resolve: 31 claims, 26 decisions, 26 questions, 14 assumptions,
+    no dangling reference in either direction. D5 appears once, as the thing
+    D20 supersedes.
+  - All 14 assumptions still carry an if-wrong line, 14 assumptions before and
+    after, 31 claims before and after.
+  - 42 fact phrases checked by text search, all present.
+
+  One real loss the check caught
+
+  - 2,880, the catch-up poll's cost per day, had gone missing in commit a87e38e
+    when section 1's arithmetic block moved to section 10. The prose kept the
+    per-minute figure and dropped the per-day one.
+  - It is back in A8. This was not from today's trimming; it had been absent for
+    several commits and the earlier checks did not catch it because each pass
+    only compared against the version before it.
+
+  Where the word count actually landed
+
+  - 5,860, against your 5,000.
+  - The compression pass cut 60 words net after the new owner and queued-edit
+    content went in. Wording compression across the whole document yielded about
+    170 words, and removing sentences a later section already stated yielded
+    about 50.
+  - That is the floor without deleting content. I checked: section 1's 14
+    assumptions at a lead plus an if-wrong line each have a floor near 1,300,
+    and the appendix's 31 claims cost about 700 however tersely they are
+    written.
+  - The one lever that closes the gap is moving the appendix into
+    docs/decisions.md, which gives 5,090 and loses no fact from the repository,
+    only from the design document. You ruled against that when I offered it at
+    4,400 and I did not want to reverse your call to hit a number. It is one
+    command if you want it.
+
+> keep the appendix in design.md, main sections are about 5100 which is fine.
+  no more cutting
+
+  one thing your check missed. A1 if wrong says at portal peak 40/sec the drain
+  rate halves and 26 min becomes about 54. that math does not work. same
+  backlog, drain is 80 - 40 = 40/sec, 108000 / 40 = 2700 sec = 45 min, and 70
+  to 40 is not half. if the busiest 6 hours average also goes up 4x to 20/sec,
+  backlog is 432000 / 40 = 10800 sec = 3 hours. put both cases in that line.
+  your check only looked that numbers were present, it did not redo the
+  division. redo every division and multiplication in the doc this time, show
+  me each one, fix and commit
+
+  then we are done with the design. no more changes after this unless something
+  is wrong
+
+● The 54 minutes was never derived. Recomputing every operation in the document
+  now.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(sed -n '448,458p' docs/decisions.md)
+  ⎿  (No output)
+
+  Made 1 scratchpad edit +77 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/recompute.py")
+  ⎿  (No output)
+
+● Three disagreements: your two, plus one I had not spotted in section 7.
+
+  Made 1 scratchpad edit +82 (ctrl+o to expand)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/fix_math.py" && git add
+      docs/decisions.md && gi…)
+  ⎿  Updated docs\decisions.md (+33 -1)
+      343  
+      344  ## D7. The edit rates, and a 6-hour outage drains in about 26 
+           minutes
+      345  
+      346 -**Status:** agreed                                            
+      346 +**Status:** agreed; the arithmetic in its "if wrong" line is c
+          +orrected by D27                                               
+      347  
+      348  **Raised by:** Abhishek, who supplied the load figures and the
+            drain
+      349  calculation. The AI checked the arithmetic and added the catch
+           -up query cost
+     ...
+      1210  itself.
+      1211  
+      1212  
+      1213 +---                                                          
+      1214 +                                                             
+      1215 +## D27. The drain time at a higher portal peak, corrected    
+      1216 +                                                             
+      1217 +**Status:** agreed, corrects the "if wrong" line of D7       
+      1218 +                                                             
+      1219 +**Raised by:** Abhishek, redoing the division.               
+      1220 +                                                             
+      1221 +**Problem:** D7's "if wrong" line said that at a portal peak 
+           +of 40 per second                                             
+      1222 +the drain rate halves and 26 minutes becomes about 54 minutes
+           +. Both halves are                                            
+      1223 +wrong. The drain rate goes from 70 to 40 per second, a fall o
+           +f 1.75 and not 2,                                            
+      1224 +and 108,000 / 40 is 2,700 seconds, which is 45 minutes. The f
+           +igure 54 was never                                           
+      1225 +derived from anything.                                       
+      1226 +                                                             
+      1227 +**Decision:** The line states two cases, because the peak and
+           + the six-hour                                                
+      1228 +average can move together or separately.                     
+      1229 +                                                             
+      1230 +- Peak alone at 40/sec: the drain gets 80 - 40 = 40/sec, and 
+           +the same 108,000                                             
+      1231 +  backlog takes 108,000 / 40 = 2,700 seconds, about 45 minute
+           +s.                                                           
+      1232 +- The busiest six-hour average rising with it, to 20/sec: the
+           + backlog is                                                  
+      1233 +  20 x 21,600 = 432,000, and 432,000 / 40 = 10,800 seconds, 3
+           + hours.                                                      
+      1234 +                                                             
+      1235 +**Pushback:** Abhishek found it. The AI had written the figur
+           +e and had checked                                            
+      1236 +only that the numbers in the document were present, not that 
+           +the divisions came                                           
+      1237 +out. Redoing all 45 operations in the design found one more d
+           +efect: section 7                                             
+      1238 +called about 0.07 same-field collisions an hour "well under o
+           +ne a day", when 24                                           
+      1239 +hours of it is 1.7 a day.                                    
+      1240 +                                                             
+      1241 +**If wrong:** nothing downstream depends on these two figures
+           +; they size the                                              
+     … 6 more lines (ctrl+o to expand)
+  ⎿  Updated docs\design.md (+9 -5)
+      34  Operating point: **80 requests per second** against the cap of 
+          100, holding
+      35  **20 per second** for retries and catch-up queries.
+      36  
+      37 -*If wrong:* at a portal peak of 40/sec the drain rate halves an
+         -d the 26 minutes                                               
+      38 -in section 10 becomes about 54 minutes.                        
+      37 +*If wrong:* at a portal peak of 40/sec the drain keeps 80 - 40 
+         += 40/sec, so the                                               
+      38 +same backlog takes 108,000 / 40 = 2,700 seconds, about 45 minut
+         +es. If the                                                     
+      39 +busiest six hours rise with the peak, to 20/sec, the backlog is
+         + 20 x 21,600 =                                                 
+      40 +432,000 and the drain takes 432,000 / 40 = 10,800 seconds, 3 ho
+         +urs. Decision                                                  
+      41 +D27.                                                           
+      42  
+      43  **A2. The outage backlog uses the busiest sustained six hours, 
+          and the drain
+      44  shares the cap with live traffic.** Peak covers the 30-second t
+          arget; a six-hour
+     ...
+      401  collisions per hour, same field       = about 0.07 if edits sp
+           read evenly
+      402  ```
+      403  
+      401 -Roughly one collision on any field every two hours at peak, an
+          -d well under one a                                            
+      402 -day on the same field. Edits cluster on busy records, so the m
+          -easured figure will                                           
+      404 +Roughly one collision on any field every two hours at peak, an
+          +d one or two a day                                            
+      405 +on the same field if the peak never let up. Edits cluster on b
+          +usy records, so the measured figure will                      
+      406  run higher than the arithmetic, which is why it is counted. If
+            it climbs, the
+      407  fallback is field ownership: each field belongs to one side an
+           d that side wins
+      408  whatever the clock says. That needs the client to assign the n
+           ine fields, so it
+     ...
+      497  Salesforce records changed  = 15/sec x 21,600 = 324,000
+      498  query calls at 2,000/page   = 324,000 / 2,000 = 162 calls
+      499  history rows at 1.5/record  = 486,000 / 2,000 = 243 calls
+      497 -catch-up total              = about 405 calls = about 20 secon
+          -ds                                                            
+      500 +catch-up total              = 162 + 243 = 405 calls           
+      501 +at the 20/sec reserve       = 405 / 20 = about 20 seconds     
+      502  ```
+      503  
+      504  The live rate subtracted is the portal peak of 10/sec, because
+            recovery at month
+
+● Bash(python - <<'PYEOF'
+      import io…)
+  ⎿  (No output)
+
+● Bash(python "C:/Users/dell/AppData/Local/Temp/claude/1a8b6659c023f801/615a1f11
+      -e04b-403b-bd09-bc2be0747dc6/scratchpad/verify2.py" | grep -E "^FAIL")
+  ⎿  (No output)
+
+● Bash(python - <<'PYEOF'
+      import io…)
+  ⎿  (No output)
+
+● Bash(git add -A && git commit -q -F - <<'COMMITEOF'
+      Redo every division in the design, and fix the two that did not come out…)
+  ⎿  (No output)
+
+● You were right, and the way you caught it was the point: my check tested that
+  numbers were present, never that they came out.
+
+  Every operation, recomputed
+
+  43 multiplications and divisions, recomputed from the inputs rather than read
+  off the page. All agree with the document now.
+
+  ┌───────────┬────────────────────────────┬───────────────────────────────┐
+  │   Where   │         Operation          │            Result             │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ A1        │ 200 users x 2 saves a      │ 6.67/sec                      │
+  │           │ minute / 60                │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ A1        │ 30 / (10/5), the portal's  │ 15/sec                        │
+  │           │ ratio applied              │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ A1        │ 6.67 / 5                   │ 1.33                          │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ A1        │ 100 - 20 reserve           │ 80/sec                        │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ A1        │ 80 - 40, then 108,000 / 40 │ 2,700 sec = 45 min            │
+  │ if-wrong  │                            │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ A1        │ 20 x 21,600, then 432,000  │ 10,800 sec = 3 hours          │
+  │ if-wrong  │ / 40                       │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 6 x 3,600                  │ 21,600 sec                    │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 5 x 21,600                 │ 108,000 records               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 80 - 10 live               │ 70/sec                        │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 108,000 / 70               │ 1,542.9 sec = 25.7 min,       │
+  │           │                            │ written as about 26           │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 15 x 21,600                │ 324,000 records               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 324,000 / 2,000            │ 162 calls                     │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 324,000 x 1.5, then /      │ 486,000 rows, 243 calls       │
+  │           │ 2,000                      │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 162 + 243, then / 20       │ 405 calls = 20.25 sec         │
+  │           │ reserve                    │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 108,000 x 324,000 /        │ 6,998 overlap records         │
+  │           │ 5,000,000                  │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 7,000 x 2 extra calls / 70 │ 200 sec = 3.3 min, written as │
+  │           │                            │  3.5                          │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 324,000 + 108,000, then /  │ 432,000 = 102.9 min, written  │
+  │           │ 70                         │ as 103                        │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 70 x 0.2, 70 x 0.5, 1 /    │ 14 in flight, 35, 5/sec       │
+  │           │ 0.2                        │                               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S10       │ 108,000 / 5                │ 21,600 sec = 6 hours          │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ A8        │ 30 x 60, 80 x 60, 2 /      │ 1,800/min, 4,800 budget,      │
+  │           │ 4,800, 2 x 1,440           │ 0.042%, 2,880/day             │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S4        │ 5,000,000 x 9              │ 45 million rows               │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S4        │ 40 x 86,400 x 365          │ 1.26 billion, written as 1.2  │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S7        │ 30 x 2 / 5,000,000         │ 0.000012                      │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S7        │ 10 x 3,600 x 0.000012      │ 0.432 an hour                 │
+  ├───────────┼────────────────────────────┼───────────────────────────────┤
+  │ S7        │ 1 / 0.432, 0.432 / 6,      │ 2.3 hours, 0.072 an hour,     │
+  │           │ 0.072 x 24                 │ 1.73 a day                    │
+  └───────────┴────────────────────────────┴───────────────────────────────┘
+
+  Three disagreed, two of them yours
+
+  - The drain at a 40/sec portal peak. The rate goes 70 to 40, a fall of 1.75,
+    not a halving, and 108,000 over 40 is 2,700 seconds, 45 minutes. The 54 was
+    never derived from anything. Both cases are now in the line: 45 minutes if
+    the peak alone rises, 3 hours if the busiest six hours rise with it to
+    20/sec and the backlog becomes 432,000.
+  - Section 7's "well under one a day". Mine, found by this pass. 0.072
+    collisions an hour on the same field is 1.73 a day, not under one. It now
+    says one or two a day if the peak never let up.
+  - The catch-up total's missing divisor. 405 calls over the 20/sec reserve is
+    20.25 seconds. The answer was right; the division was not written down, so a
+    reader could not check it. It is written out now.
+
+  D7's if-wrong line was wrong in the log too. D27 corrects it, committed on its
+  own as e72deec before the document changed, and D7's status line is the only
+  thing that moved on it.
+
+  State of the submission
+
+  - Design: 5,917 words, 12 sections plus the appendix, which stays in the
+    document.
+  - Decision log: 27 decisions, 26 client questions, 2 recorded problems.
+  - 43 arithmetic operations recomputed with zero disagreements, and 56
+    structural checks passing: sections present and ordered, no placeholder
+    text, no number lost except the 54 removed on purpose, the lane split
+    consistent across sections 10 and 11, every claim, decision, question and
+    assumption pointer resolving, and every assumption keeping its if-wrong
+    line.
+  - Working tree clean, nothing squashed, 16 commits.
+
+  The design is done. I will not touch it again unless something turns out to be
+  wrong.
