@@ -250,12 +250,37 @@ never synchronised. That belongs to the conflict rule in section 7.
 *If wrong:* without the lock, two saves to one record can commit in the opposite
 order to their timestamps, and the later save silently loses.
 
+**A10. A record's identity is a portal UUID, and Salesforce writes are keyed on
+an external ID field holding it.** A portal create has no Salesforce ID until
+the call returns, which during an outage can be hours. The UUID is the primary
+key everywhere in our database and never changes; `salesforce_id` is a nullable
+column filled in when Salesforce answers. Decision D11.
+
+- **Verified:** the REST API upserts on a custom external ID field, answering
+  201 when it created a record. A value matching more than one record answers
+  300 and writes nothing.
+- **Verified:** a field marked External ID and Unique acts as a unique index and
+  blocks duplicates. Without Unique, the caller needs View All Data.
+- **Assumption:** such a field can be added to Contact and Account in the
+  client's org. Questions Q15 and Q16 in the decision log.
+- An inbound event carrying a Salesforce ID we hold no mapping for is normal:
+  every record created by a sales user arrives that way. The record is
+  retrieved, and a populated external ID binds it to the portal UUID while an
+  empty one means a new Salesforce-origin record. Binding happens even when the
+  event is then dropped as our own echo.
+- A populated external ID pointing at a portal record already bound to a
+  different Salesforce ID is a duplicate in Salesforce. That one is parked for a
+  person.
+
+*If wrong:* with no external ID field available, a create is a plain insert
+guarded by a claim row in Postgres, and duplicates after a timeout have to be
+found by a reconciliation query.
+
 ### 1.5 Still open
 
 Silent in the brief, with no working assumption yet. Each is tracked in
 `docs/decisions.md` with the reason it matters.
 
-- How a portal-created record is identified before Salesforce assigns it an ID.
 - What the second user sees when two portal users edit the same field at once.
 - What happens when Salesforce rejects a write permanently.
 - Whether the initial load of 5 million records is in scope.

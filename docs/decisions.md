@@ -655,6 +655,47 @@ tiebreak, most likely a per-record version column updated in the same statement.
 
 ---
 
+---
+
+## D11. A portal record's identity is our own UUID, and Salesforce writes go through an upsert on an external ID field
+
+**Status:** agreed
+
+**Raised by:** Abhishek, asking how a portal-created record is identified before
+Salesforce has assigned it an ID.
+
+**Problem:** A portal create has no Salesforce ID until the call returns, which
+may be hours later during an outage. A retried create with no idempotency key
+makes a duplicate contact in Salesforce.
+
+**Options, and why they lost:**
+
+- **The Salesforce ID as the primary key, with a placeholder.** Rejected: the
+  key has to be rewritten across history rows, the outbox and the shadow copy at
+  the moment the system is busiest, and a partial rewrite orphans history.
+- **A create-then-record-the-ID sequence with no external ID.** Rejected: a
+  timeout or a restart mid-outage replays the create and duplicates the record.
+
+**Decision:** Every record carries a portal UUID as its primary key, assigned at
+creation and never changed. `salesforce_id` is a nullable column filled in when
+Salesforce answers. Outbound writes for records we created go to the upsert
+resource keyed on an external ID field holding that UUID, so a replayed create
+matches the existing record. An inbound event for an unknown Salesforce ID is
+resolved by retrieving the record and checking that field, never parked
+immediately; a new Salesforce-origin record arrives this way on every create.
+
+**Pushback:** Abhishek rejected the AI's framing of the external ID as a later
+improvement and made it part of the decision, because the upsert is what makes
+outbox replay safe. The AI argued against matching on an external ID carried in
+the webhook payload, since the brief's sample has no such field and the webhook
+is a custom mechanism; the retrieve works without it.
+
+**If wrong:** if no external ID field can be added to Contact and Account in the
+client's org, the create becomes a plain insert guarded by a claim row in
+Postgres, and a duplicate after a timeout becomes possible and has to be
+detected by a reconciliation query.
+
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
@@ -677,6 +718,8 @@ assumption and the question we would have asked.
 | Q12 | How long after a change commits does Salesforce make it visible to a SystemModstamp query? | The continuous poll in D9 overlaps its window to cover this lag. If the lag is longer than the overlap, changes are missed silently. |
 | Q13 | Does the client's Salesforce org limit query volume more tightly than the record API cap? | The poll in D9 costs about 2 calls a minute. A separate query limit would stretch the interval and with it the repair time for a lost webhook. |
 | Q14 | Who reviews webhooks that the endpoint cannot interpret, and how quickly? | D8 parks them in a table and counts them. A parked webhook is a change that has not been applied. |
+| Q15 | Can an external ID field, unique, be added to Contact and Account to hold our portal UUID? | D11 keys the outbound upsert on it. Without it a retried create can duplicate a record in Salesforce. |
+| Q16 | Can the webhook carry that external ID field alongside the Salesforce ID? | It would save a retrieve call on the first event for a record we created. The design works without it. |
 
 ---
 
