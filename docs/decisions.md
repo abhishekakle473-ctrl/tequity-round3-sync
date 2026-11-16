@@ -623,6 +623,38 @@ apply, and overlap the window to cover commit visibility lag.
 
 ---
 
+## D10. A portal save is ordered by a Postgres sequence drawn under a row lock
+
+**Status:** agreed
+
+**Raised by:** The brief, which states the portal sample has no time field and
+asks where the time and the actor come from.
+
+**Problem:** Two saves to one record can commit in the opposite order to their
+timestamps, so the later save loses silently.
+
+**Options, and why they lost:**
+
+- **The time the browser sent.** Rejected: a user's machine clock can be wrong
+  by hours, and that edit would win or lose every conflict it touched.
+- **A sequence alone, no lock.** Rejected: `now()` in Postgres is the
+  transaction start time, and a number drawn before the lock can invert.
+
+**Decision:** The actor comes from the signed-in session, never from `editedBy`
+in the body. The save takes a row lock on the record, then draws a sequence
+number and the timestamp. The lock covers the local transaction only, never a
+Salesforce call.
+
+**Pushback:** Abhishek raised the `now()` problem and proposed the row lock. The
+AI added that the sequence and the timestamp must both be taken after the lock,
+that the inbound path must take the same lock, and that multi-record saves need
+a fixed lock order.
+
+**If wrong:** without the lock, concurrent saves to one record need a different
+tiebreak, most likely a per-record version column updated in the same statement.
+
+---
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
