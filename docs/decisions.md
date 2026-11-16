@@ -343,7 +343,7 @@ in Postgres for the duration of the call.
 
 ## D7. The edit rates, and a 6-hour outage drains in about 26 minutes
 
-**Status:** agreed
+**Status:** agreed; the arithmetic in its "if wrong" line is corrected by D27
 
 **Raised by:** Abhishek, who supplied the load figures and the drain
 calculation. The AI checked the arithmetic and added the catch-up query cost
@@ -1208,6 +1208,38 @@ resolution by our own timestamp rule does not.
 **If wrong:** if users find a silently dropped edit unacceptable, the row is
 parked instead and the note becomes an alert, with no change to the comparison
 itself.
+
+
+---
+
+## D27. The drain time at a higher portal peak, corrected
+
+**Status:** agreed, corrects the "if wrong" line of D7
+
+**Raised by:** Abhishek, redoing the division.
+
+**Problem:** D7's "if wrong" line said that at a portal peak of 40 per second
+the drain rate halves and 26 minutes becomes about 54 minutes. Both halves are
+wrong. The drain rate goes from 70 to 40 per second, a fall of 1.75 and not 2,
+and 108,000 / 40 is 2,700 seconds, which is 45 minutes. The figure 54 was never
+derived from anything.
+
+**Decision:** The line states two cases, because the peak and the six-hour
+average can move together or separately.
+
+- Peak alone at 40/sec: the drain gets 80 - 40 = 40/sec, and the same 108,000
+  backlog takes 108,000 / 40 = 2,700 seconds, about 45 minutes.
+- The busiest six-hour average rising with it, to 20/sec: the backlog is
+  20 x 21,600 = 432,000, and 432,000 / 40 = 10,800 seconds, 3 hours.
+
+**Pushback:** Abhishek found it. The AI had written the figure and had checked
+only that the numbers in the document were present, not that the divisions came
+out. Redoing all 45 operations in the design found one more defect: section 7
+called about 0.07 same-field collisions an hour "well under one a day", when 24
+hours of it is 1.7 a day.
+
+**If wrong:** nothing downstream depends on these two figures; they size the
+risk if the client's portal load is four times the assumption.
 
 
 # Open questions for the client
