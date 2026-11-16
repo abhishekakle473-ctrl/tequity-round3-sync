@@ -1140,6 +1140,76 @@ records and deletes have to come into scope properly, with a decision on which
 side a delete propagates to.
 
 
+---
+
+## D25. Owner is translated through a hand-filled user map
+
+**Status:** agreed
+
+**Raised by:** A builder reading the design cold, who found owner to be the only
+one of the nine fields whose value is a person and not a value.
+
+**Problem:** A Salesforce `OwnerId` means nothing to the portal and a portal
+user means nothing to Salesforce. Without a translation an owner change cannot
+be applied inbound or sent outbound, and the stale-save message in A12 cannot
+name the person who changed a field.
+
+**Options, and why they lost:**
+
+- **Treat owner as an opaque value that passes through untranslated.**
+  Rejected: the portal would show a Salesforce ID where a name belongs, and the
+  brief asks who changed what.
+
+**Decision:** A `user_map` table of portal user to Salesforce User ID, filled by
+hand. Keeping it in step with either system's user list is out of scope. An
+inbound owner with no portal counterpart is stored as the raw Salesforce ID, so
+nothing is lost and the change still applies. An outbound owner with no
+Salesforce counterpart is refused at save time, before an outbox row exists,
+because that one can be caught early.
+
+**Pushback:** none. Abhishek took the AI's proposal and confirmed the asymmetry
+between the two unknown-user cases, which is deliberate: inbound keeps the
+change, outbound refuses it.
+
+**If wrong:** if the client provisions users often, the hand-filled table goes
+stale and owner changes start parking, at which point the map has to be
+populated from a Salesforce user query.
+
+---
+
+## D26. A queued edit that loses a conflict is dropped, field by field
+
+**Status:** agreed
+
+**Raised by:** A builder reading the design cold, who found that nothing said
+what happens to an outbox row waiting on a field an inbound change has just won.
+
+**Problem:** A portal edit is queued. A Salesforce change arrives, wins that
+field under D16, and is applied. The queued row would then overwrite the winner
+with a value our own rule has already judged stale.
+
+**Options, and why they lost:**
+
+- **Send it anyway.** Rejected: it breaks the conflict rule one step after
+  applying it, and the two sides end up disagreeing with our own decision.
+- **Park the row for a person.** Rejected: this is not the D12 case. There
+  Salesforce refused a write by its own rules and a person has to judge it.
+  Here our rule chose by time, and the outcome is already decided.
+
+**Decision:** The losing field is removed from the queued outbox row. The other
+fields in that row still go, because the conflict is per field. The losing value
+is marked superseded in `field_history`, and the portal user who made it sees
+the same note as any other lost conflict.
+
+**Pushback:** Abhishek rejected the AI's framing of this as the same call as
+D12. The distinction holds: a rejection by Salesforce needs a person, a
+resolution by our own timestamp rule does not.
+
+**If wrong:** if users find a silently dropped edit unacceptable, the row is
+parked instead and the note becomes an alert, with no change to the comparison
+itself.
+
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
@@ -1173,7 +1243,7 @@ assumption and the question we would have asked.
 | Q23 | Does the webhook fire on every change, including API writes, bulk loads and mass reassignment, or only on edits made in the Salesforce interface? | If it covers interface edits only, the minute poll stops being a safety net and becomes the main inbound path, which inverts the build order in D17. |
 | Q24 | Is there a 24-hour API allocation behind the 100 calls a second, and what do the org's other integrations already consume? | The operating point, the drain and the poll are budgeted against a per-second cap only. A daily allocation binds all three together. |
 | Q25 | Are Person Accounts enabled in the org? | They change the Contact model, and with it the field that holds the customer a contact belongs to. |
-| Q26 | How does a Salesforce `OwnerId` map to a portal user, in both directions? | Owner is one of the nine fields and the only one whose value is an identity. Without a mapping, an owner change cannot be applied or sent. |
+| Q26 | Who maintains the portal-user to Salesforce-User map, and how often do users change? | D25 fills the map by hand and leaves syncing it out of scope. Frequent provisioning makes it go stale and owner changes start parking. |
 
 ---
 
