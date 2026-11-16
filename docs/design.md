@@ -281,3 +281,68 @@ which is ordinary for Postgres. `field_history` grows with edits, at roughly
 stops. It is partitioned by month so old partitions can be detached, and nothing
 in the sync path queries it.
 
+## 5. The inbound path, from webhook to our database
+
+The endpoint does as little as it can, because it has to answer in
+milliseconds while the worker may be blocked for six hours (A14).
+
+1. Verify the signature over the raw bytes, before parsing (A9). A failure is
+   refused with a 401 and nothing is stored.
+2. Compute the deduplication key and insert a row into `inbox`. A key already
+   present means a repeat delivery, and the insert does nothing.
+3. Answer 200. The webhook is now durable, and a restart cannot lose it.
+
+The worker then claims inbox rows with `SELECT ... FOR UPDATE SKIP LOCKED` and,
+for each one:
+
+1. Normalise the payload through the adapter into a list of field changes, each
+   with field name, new value, event time and actor (A7). A payload the adapter
+   cannot interpret is parked and counted, and the row is marked parked rather
+   than retried.
+2. Resolve the record. A known `salesforce_id` maps to a portal UUID. An unknown
+   one is retrieved from Salesforce, and its external ID either binds it to an
+   existing portal record or shows it to be new (A11).
+3. Take the record's row lock, the same lock a portal save takes (A10).
+4. Apply the loop rule (section 9). An echo of our own write stops here, after
+   the binding in step 2 has been kept.
+5. For each changed field, apply the conflict rule (section 7), write
+   `field_history`, update `field_value` when the change wins, and update
+   `salesforce_shadow` either way, since the shadow is what Salesforce holds and
+   not what we chose.
+6. Mark the inbox row applied, in the same transaction as the writes.
+
+Nothing in this path calls Salesforce except step 2, and only for a record we
+have never seen.
+
+## 6. The outbound path, from a portal edit to a Salesforce API call
+
+A portal save takes the record's row lock, draws the sequence number and the
+server timestamp under it (A10), checks the field versions the form carried
+(A12), and writes `field_value`, `field_history` and one `outbox` row in a
+single transaction. The user's save is complete at that point. No Salesforce
+call is on their path.
+
+The worker claims outbox rows the same way the inbox is claimed, and before
+sending it merges every pending row for that record into one call (D4), so a
+field edited five times during an outage costs one request.
+
+The call is a PATCH to the upsert resource keyed on the external ID holding the
+record's portal UUID (A11), carrying `If-Unmodified-Since` built from the
+record's last-seen SystemModstamp in the shadow (A5).
+
+Outcomes:
+
+| Response | What happens |
+|---|---|
+| 2xx | Update the shadow from the response, mark the outbox row done. 201 means the record was created, so the returned Salesforce ID is stored. |
+| 412 | Salesforce changed first. Re-read the record, apply the conflict rule per field, send what still wins. Costs three calls, which the drain arithmetic allows for. |
+| 403 with `REQUEST_LIMIT_EXCEEDED` | Slow down. The backoff time is written to `sync_state` and every worker thread honours it. The row stays queued. |
+| 5xx, a timeout, or a connection failure | Retry with exponential backoff and jitter. The row stays queued, which is the six-hour outage case. |
+| Any other 4xx | Park the row with its error code and mark the record out of step in the portal (A13). |
+| 300 | The external ID matched more than one Salesforce record. Park it for a person; no automatic rule can choose. |
+
+The rate limiter is a token bucket at 80 per second, divided between running
+worker instances, with every retry counted. Concurrency is capped at the number
+of requests needed to reach the rate at the measured round-trip time, which is
+14 in flight at 200 milliseconds.
+
