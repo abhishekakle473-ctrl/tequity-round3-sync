@@ -844,6 +844,130 @@ edit twice.
 into separate deployable units with no change to the tables between them.
 
 
+---
+
+## D16. The current value of a field is the later edit, by occurredAt against our server time
+
+**Status:** agreed
+
+**Raised by:** The brief, which asks what decides which edit is current, on a
+webhook and on a portal save, and asks for the field to be named.
+
+**Problem:** Both sides may change the same field. One value has to be current,
+the other has to stay on record, and the two timestamps come from machines
+nobody synchronised.
+
+**Options, and why they lost:**
+
+- **Salesforce wins every conflict.** Rejected: a finance correction loses to a
+  stale sales edit with nothing to distinguish it from a defect.
+- **Each field has an owning side.** Held back, not rejected. It is the only
+  rule that cannot be wrong about the brief's own scenario, and it needs the
+  client to assign nine fields. It goes to the client as Q20 and is the fallback
+  if the too-close-to-call counter climbs.
+- **No automatic winner, a person picks.** Rejected: it misses the 30-second
+  target by construction.
+
+**Decision:** Per field, the later edit is current. The Salesforce side is
+`occurredAt` from the webhook; our side is the Postgres server timestamp taken
+under the row lock, with the sequence number from D10 breaking ties among portal
+saves. Clock skew is measured, not assumed: every Salesforce response carries an
+HTTP `Date` header, and the worker keeps a running offset and applies it before
+comparing. Inside one second the two are too close to call, Salesforce wins, and
+a counter goes up. The losing value is written to history either way, so no edit
+is ever discarded.
+
+**Pushback:** Abhishek rejected two of the AI's own arguments against this rule.
+The AI claimed ties would be constant at 30 edits a second, which confused any
+two edits in a second with two edits to the same field of the same record.
+Abhishek's arithmetic, checked and reproduced: 30 Salesforce edits a second over
+a 2-second window touch 60 of 5,000,000 records, a 0.000012 chance per portal
+edit; at a portal peak of 10 a second, 36,000 portal edits an hour, that is 0.43
+collisions an hour on any field, and about 0.07 an hour on the same field if
+edits spread evenly across the six contact fields. Hot records cluster, so the
+counter stays. The AI also called the outage case a flaw; Abhishek pointed out
+that a later Salesforce edit should win, and the gap is the finance user not
+knowing why, which history and a note on the record cover.
+
+**If wrong:** if `occurredAt` turns out to be the send time and not the edit
+time, the comparison is against a clock that moves with retries and delivery
+delay, and the rule falls back to field ownership.
+
+---
+
+## D17. The build order starts with the field-level data model and history
+
+**Status:** agreed
+
+**Raised by:** Abhishek.
+
+**Problem:** The brief asks for the subproblems in the order to build them.
+
+**Decision:** The field-level data model and history come first, because
+everything else is built on them and they are the hardest thing to change later.
+Then the inbound apply with deduplication and ordering, then the outbox and the
+rate limiter, then the loop rule, then the catch-up poll and the outage path,
+then monitoring. Each step is useful on its own and testable against a fake
+Salesforce.
+
+**Pushback:** none. The AI would have put the inbound path first and agrees the
+schema is the harder thing to undo.
+
+**If wrong:** if the client's field list grows, the field-level model absorbs it
+without a migration, which is part of why it comes first.
+
+---
+
+## D18. Three numbers decide whether the sync is healthy
+
+**Status:** agreed
+
+**Raised by:** Abhishek.
+
+**Problem:** The brief asks for three numbers to watch and the value at which to
+call someone.
+
+**Decision:**
+
+- The age of the oldest pending outbox row. Call someone at 60 seconds while
+  Salesforce is up, because the target is 30 seconds and 60 means the drain is
+  losing ground.
+- The count of parked and failed items. Call someone if it grows for 10 minutes
+  without pause, which separates a bad deployment from one awkward record.
+- The share of changes found by the catch-up poll with no webhook explaining
+  them. Call someone above 1 per cent, because the poll is a safety net and a
+  rising share means webhook delivery is failing quietly.
+
+**Pushback:** none. The AI added that the third number is the only one that
+detects silent loss, so it is the one worth watching during a quiet week.
+
+**If wrong:** if normal webhook delivery is less reliable than 99 per cent, the
+third threshold fires constantly and has to be set from a measured baseline.
+
+---
+
+## D19. What is out of scope for this weekend
+
+**Status:** agreed
+
+**Raised by:** Abhishek, with the brief's own list.
+
+**Problem:** The brief names things out of scope and asks the design to say what
+is left out.
+
+**Decision:** Deletes, any user interface, a second region, and code. The
+initial load of the 5,000,000 records is out of scope too, and the design
+assumes the two sides already hold the same records. The brief's list also
+excludes Salesforce login screens and a load test against real Salesforce.
+
+**Pushback:** The AI noted that assuming the two sides start in step hides a
+one-off job that competes for the same 100 calls a second, which is why it stays
+a question for the client as Q10.
+
+**If wrong:** an in-scope backfill needs its own throttle below the live
+operating point, and the catch-up watermark has to start after it finishes.
+
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
@@ -870,6 +994,8 @@ assumption and the question we would have asked.
 | Q16 | Can the webhook carry that external ID field alongside the Salesforce ID? | It would save a retrieve call on the first event for a record we created. The design works without it. |
 | Q17 | Can the client's Salesforce side compute an HMAC signature over the webhook body with a shared secret? | D14 assumes it can. The fallback is weaker against replay. |
 | Q18 | Which Salesforce API version does the client's integration target? | The upsert in D11 answers 204 with no body on version 45.0 and earlier, and 200 with a body from 46.0 on. |
+| Q19 | Is `occurredAt` the time the field changed, or the time the event was sent? | D16 compares it against our server clock. A send time moves with retries and delivery delay. |
+| Q20 | Which side owns each of the nine fields, if we ever need to decide conflicts by ownership? | D16 keeps field ownership in reserve, to be used if the too-close-to-call counter climbs. |
 
 ---
 
