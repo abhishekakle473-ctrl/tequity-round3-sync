@@ -346,3 +346,93 @@ worker instances, with every retry counted. Concurrency is capped at the number
 of requests needed to reach the rate at the measured round-trip time, which is
 14 in flight at 200 milliseconds.
 
+## 7. The rule when both sides change the same field
+
+The comparison is per field, never per record, so an edit to the city and an
+edit to the phone both survive with no conflict at all. That covers the brief's
+own scenario.
+
+The fields compared, named as the brief asks:
+
+- Salesforce side: `occurredAt` from the webhook, the time Salesforce gives the
+  event.
+- Our side: the Postgres server timestamp taken under the row lock, with the
+  sequence number breaking ties among portal saves (A10).
+
+The later one is current. Both values are written to `field_history` either way,
+so the edit that loses is kept with its actor and its time, and nothing is
+discarded.
+
+Those two clocks were never synchronised, so the offset between them is
+measured and not assumed. Every Salesforce HTTP response carries a `Date`
+header, and the worker keeps a running estimate of the difference against its
+own clock and applies it before comparing. When the two times are within one
+second of each other after that correction, they are too close to call:
+Salesforce wins, and a counter records it.
+
+That counter is the honest part of this rule. It is the number that would show
+the rule failing. How often it should fire, at the rates in A1:
+
+```
+Salesforce edits in a 2-second window = 30/sec x 2 = 60 records
+chance one of them is a given record  = 60 / 5,000,000 = 0.000012
+portal edits in an hour at peak       = 10/sec x 3,600 = 36,000
+collisions per hour, any field        = 36,000 x 0.000012 = about 0.43
+collisions per hour, same field       = about 0.07 if edits spread evenly
+```
+
+Roughly one collision on any field every two hours at peak, and well under one a
+day on the same field. Edits cluster on busy records, so the measured figure
+will be higher than the arithmetic, which is why it is counted and not assumed.
+If it climbs, the fallback is field ownership: each field belongs to one side
+and that side wins whatever the clock says. That needs the client to assign the
+nine fields, so it is question Q20 and stays out of the design for now.
+
+The rule rests on `occurredAt` being the time the field changed and not the time
+the event was sent (claim C24). On a retried or batched delivery those differ.
+Decision D16.
+
+## 8. A duplicate webhook, and an older webhook arriving after a newer one
+
+The brief says both happen.
+
+A duplicate is stopped at the endpoint. The deduplication key is the Salesforce
+record ID, `occurredAt`, and a hash of the changed fields, with a unique index
+on it. A second delivery of the same event finds the key present, stores
+nothing, and still answers 200, because an error would only invite another
+redelivery. Two genuinely separate edits in the same second with the same values
+produce the same key and collapse into one, which loses nothing: the value and
+the time are identical, and only one history row would differ, by actor.
+
+Out-of-order delivery is handled by the same comparison that settles conflicts.
+Each field carries the event time of its current value, so a webhook arriving
+with an older `occurredAt` than the field already holds is written to
+`field_history` as superseded and does not become current. No reordering buffer
+is needed, and no event has to be held back waiting for one that might never
+come.
+
+A webhook for a Salesforce record we hold no mapping for is ordinary traffic,
+not an error, and is resolved by retrieving the record (A11).
+
+## 9. The rule that stops a loop
+
+Our write to Salesforce comes back to us as a webhook. Left alone, applying it
+would produce another write, and so on.
+
+Two checks, in this order:
+
+1. **Identity.** If `changedBy` is our integration user, the event is our own
+   echo and stops here. It is cheap and it catches the normal case (A6).
+2. **Value.** If the incoming value already matches `salesforce_shadow` for that
+   field, Salesforce is telling us something we already know, and the event
+   stops here too.
+
+Identity comes first because a Salesforce automation that fires after our write
+changes the record again under a different actor, and that change is genuine and
+must be applied. The value check catches what identity misses, including a
+webhook whose `changedBy` is missing or unexpected.
+
+One ordering rule matters: when an echo is for a record we have just created,
+the binding of the Salesforce ID to the portal UUID is kept before the event is
+dropped (A11). Decision D5.
+
