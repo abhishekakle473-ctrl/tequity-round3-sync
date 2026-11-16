@@ -1077,6 +1077,69 @@ lane gets nothing and the drain never finishes, so the backlog drain time has to
 be watched and the operating point raised toward the cap.
 
 
+---
+
+## D23. Outbound sending stays on for the integration user
+
+**Status:** agreed
+
+**Raised by:** A builder reading the design cold, who found section 2 and
+section 9 contradicting each other.
+
+**Problem:** Section 2 listed "outbound webhook sending switched off for the
+integration user's profile" among the changes the client makes, which is the
+common way to stop an echo. Section 9 relies on our write coming back, because a
+flow fired by our write carries our integration user too (claim C29), and the
+field comparison is what separates the echo from the automation result.
+Suppressing the profile's events would suppress the automation results with
+them, and they would only ever reach us through the minute poll.
+
+**Options, and why they lost:**
+
+- **Suppress and rely on the poll for automation results.** Rejected: it turns
+  the safety net into the primary channel for a whole class of change, and
+  delays it by up to two poll intervals when webhooks exist that would have
+  carried it in seconds.
+
+**Decision:** Sending stays on for the integration user. The echo is removed by
+the field comparison in D20, which has to exist anyway. Only the filtering half
+of the common practice in claim C19 is used.
+
+**Pushback:** the builder found the contradiction. The AI had written both lines
+and not noticed they could not both hold.
+
+**If wrong:** if the volume of echoes costs too much inbound work, the profile
+can be suppressed later, and the poll then has to carry automation results with
+a tighter interval.
+
+---
+
+## D24. An upsert that creates a record we expected to update is parked
+
+**Status:** agreed
+
+**Raised by:** A builder reading the design cold.
+
+**Problem:** Deletes are out of scope, and every outbound write is an upsert
+keyed on the external ID. A record deleted in Salesforce would be silently
+recreated by the next portal edit, and the catch-up poll never sees deletes at
+all, so nobody would know.
+
+**Decision:** When the upsert answers 201, meaning it created a record, and the
+record already held a `salesforce_id`, the record was deleted in Salesforce.
+The new Salesforce ID is stored, the record is marked out of step, and the event
+is parked for a person. No automatic rule can decide whether a delete was
+intended.
+
+**Pushback:** none; the builder found the hole and the AI chose the rule, which
+costs nothing because the 201 is already distinguished from the 200 or 204 of an
+update (claim C24).
+
+**If wrong:** if deletes turn out to be routine, this parks a steady stream of
+records and deletes have to come into scope properly, with a decision on which
+side a delete propagates to.
+
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
@@ -1107,6 +1170,10 @@ assumption and the question we would have asked.
 | Q20 | Which side owns each of the nine fields, if we ever need to decide conflicts by ownership? | D16 keeps field ownership in reserve, to be used if the too-close-to-call counter climbs. |
 | Q21 | Does `eventId` stay the same across redeliveries of one event, or change on each attempt? | D21 makes it the deduplication key. A new value per attempt makes duplicates undetectable by it. |
 | Q22 | What automation runs in the org on Contact and Account, and under which user? | D20 applies the fields an automation changed after our write. Apex triggers and flows may be attributed differently. |
+| Q23 | Does the webhook fire on every change, including API writes, bulk loads and mass reassignment, or only on edits made in the Salesforce interface? | If it covers interface edits only, the minute poll stops being a safety net and becomes the main inbound path, which inverts the build order in D17. |
+| Q24 | Is there a 24-hour API allocation behind the 100 calls a second, and what do the org's other integrations already consume? | The operating point, the drain and the poll are budgeted against a per-second cap only. A daily allocation binds all three together. |
+| Q25 | Are Person Accounts enabled in the org? | They change the Contact model, and with it the field that holds the customer a contact belongs to. |
+| Q26 | How does a Salesforce `OwnerId` map to a portal user, in both directions? | Owner is one of the nine fields and the only one whose value is an identity. Without a mapping, an owner change cannot be applied or sent. |
 
 ---
 

@@ -239,11 +239,24 @@ Traffic crosses the boundary in two directions, both over HTTPS:
 ```
 
 Salesforce never reads our database, and we never run code inside Salesforce.
-Four things have to change on the client's side before any of this works: field
+The webhook sender is the client's. The brief hands it to us as something that
+exists, and section 2's boundary holds because we never run code in their org.
+Whether it fires on every change or only on edits made in the Salesforce
+interface is question Q23, and the answer decides whether the poll is a safety
+net or the main inbound path.
+
+Three things have to change on the client's side before any of this works: field
 history tracking switched on for the nine fields, a custom field marked External
-ID and Unique added to Contact and Account, an integration user created with
-outbound webhook sending switched off for its profile, and the webhook
-configured to sign its payload.
+ID and Unique added to Contact and Account, and an integration user created,
+with its payload signed.
+
+Outbound sending stays **on** for that integration user. Suppressing it is the
+usual way to stop an echo, and it would also suppress the automation results the
+loop rule exists to keep (section 9). The echo is removed by comparison instead.
+Decision D23.
+
+The portal is Tequity's own, so the changes it needs, per-field versions in the
+forms, the row lock and the out-of-step marker, are ours to make.
 
 ## 3. The subproblems, in the order to build them
 
@@ -341,6 +354,7 @@ Outcomes:
 | Response | What happens |
 |---|---|
 | 2xx | Update the shadow from the response, mark the outbox row done. 201 means the record was created, so the returned Salesforce ID is stored. |
+| 201 on a record that already held a `salesforce_id` | The record was deleted in Salesforce. Store the new ID, mark the record out of step, and park it for a person. Deletes are out of scope and the poll never sees them (D24). |
 | 412 | Salesforce changed first. Re-read the record, apply the conflict rule per field, send what still wins. Costs three calls, which the drain arithmetic allows for. |
 | 403 with `REQUEST_LIMIT_EXCEEDED` | Slow down. The backoff time is written to `sync_state` and every worker thread honours it. The row stays queued. |
 | 5xx, a timeout, or a connection failure | Retry with exponential backoff and jitter. The row stays queued, which is the six-hour outage case. |
@@ -564,7 +578,7 @@ quoting the documentation (P1).
 | C16 | An HTTP-date carries one-second resolution, so two edits in the same second are indistinguishable to the check | Assumption, from the HTTP specification |
 | C17 | Which timestamp the check compares against: Salesforce says "last modified date" and names no field | Not determined |
 | C18 | Salesforce attributes a change to the user whose credentials made the API call | Verified |
-| C19 | Filtering inbound events on the integration user's identity, and switching off outbound sending for that profile, is common integration practice | Verified as practice |
+| C19 | Filtering inbound events on the integration user's identity, and switching off outbound sending for that profile, is common integration practice. Only the filtering half is used here; see D23 | Verified as practice |
 | C20 | The client's webhook populates `changedBy` from the record's last modifier on every event | Assumption, the webhook is custom |
 | C21 | The REST API upserts on a custom external ID field, answering 201 when it created a record | Verified |
 | C22 | An external ID value matching more than one record answers 300 and writes nothing | Verified |
