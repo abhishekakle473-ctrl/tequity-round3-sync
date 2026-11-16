@@ -76,13 +76,14 @@ information is kept on our side. Decision D6, claims C12 to C17.
 read-then-write with no server-side protection, needing a short row lock in
 Postgres for the duration of the call.
 
-**A6. Our own write comes back identified as our integration user.** The loop
-rule checks identity first, then compares values, because a Salesforce
-automation firing after our write changes the record again under a different
-actor, and that change is genuine. Decision D5, claims C18 to C20.
+**A6. Our own write comes back identified as our integration user, and so does
+any automation it sets off.** A record-triggered flow runs as the user who made
+the edit, so identity alone cannot separate our echo from a change the org made
+afterwards. Identity marks an event a likely echo; the comparison against what
+we sent decides, field by field. Decision D20, claims C18 to C20 and C29 to C30.
 
-*If wrong:* without a usable `changedBy`, every inbound event goes through value
-comparison; loop protection holds and inbound throughput suffers.
+*If wrong:* if this org's automation runs under a different user, the identity
+check alone would have been enough and this rule gives the same answer anyway.
 
 ### 1.3 The inbound path
 
@@ -99,14 +100,13 @@ null rule breaks, since a field never sent becomes indistinguishable from one
 deliberately cleared.
 
 **A8. The catch-up query runs every minute, all the time.** A changed-fields
-payload never re-asserts state, so one webhook lost to a network failure leaves
-a record wrong until somebody edits that field again. The same query covers a
-lost webhook and a six-hour outage, at 2 calls a minute out of 4,800, which is
-0.04 per cent. The cost is the per-object floor and not the record volume, so
-polling more often is close to free; one minute is chosen for repair time.
-Because the lag between a Salesforce commit and its visibility to a query is
-undocumented (claim C26), each window overlaps the last generously and stops
-short of the present moment. Decision D9.
+payload never re-asserts state, so a webhook lost to a network failure leaves a
+record wrong until somebody edits that field again. The same query covers a lost
+webhook and a six-hour outage, at 2 calls a minute out of 4,800, which is 0.04
+per cent. The cost is the per-object floor and not the record volume, so polling
+more often is close to free; one minute is chosen for repair time. Because the
+lag between a commit and its visibility to a query is undocumented (claim C26),
+each window overlaps the last generously. Decision D9.
 
 *If wrong:* a visibility lag longer than the overlap loses changes silently,
 which is the worst failure mode here; the fix is a wider overlap at no extra
@@ -128,13 +128,12 @@ weaker against replay and stated as such.
 a sequence, under a row lock.** The brief's portal sample carries no time field,
 so both the time and the actor have to come from somewhere. Decision D10.
 
-- The actor is the signed-in portal user from the session. The sample's
-  `editedBy` is filled in by us and never trusted from the request body.
-- The save locks the record row first, so saves to one record run one after
-  another. The sequence number and the timestamp are both drawn after the lock
-  is held, or the order can still invert.
-- The inbound path takes the same lock; a save touching several records locks
-  them in a fixed order; the lock never covers a call to Salesforce.
+The actor is the signed-in portal user from the session, so the sample's
+`editedBy` is filled in by us and never trusted from the request body. The save
+locks the record row first, and both the sequence number and the timestamp are
+drawn after the lock is held, or the order can still invert. The inbound path
+takes the same lock, a save touching several records locks them in a fixed
+order, and the lock never covers a call to Salesforce.
 
 *If wrong:* without the lock, two saves to one record can commit in the opposite
 order to their timestamps, and the later save silently loses.
@@ -145,13 +144,12 @@ never changes; `salesforce_id` is nullable and filled in when Salesforce
 answers. A replayed create then matches the existing record instead of making a
 second one. Decision D11, claims C21 to C25.
 
-- An event carrying a Salesforce ID we hold no mapping for is normal: every
-  record a sales user creates arrives that way. The record is retrieved, and a
-  populated external ID binds it to the portal UUID while an empty one means a
-  new Salesforce-origin record. Binding happens before the event is dropped as
-  our own echo.
-- An external ID pointing at a portal record already bound to a different
-  Salesforce ID is a duplicate, and is parked for a person.
+An event carrying a Salesforce ID we hold no mapping for is normal: every
+record a sales user creates arrives that way. The record is retrieved, and a
+populated external ID binds it to the portal UUID while an empty one means a new
+Salesforce-origin record. Binding happens before anything is dropped as our own
+echo. An external ID pointing at a portal record already bound to a different
+Salesforce ID is a duplicate, and is parked for a person.
 
 *If wrong:* with no external ID field available, a create is a plain insert
 guarded by a claim row in Postgres, and duplicates after a timeout have to be
@@ -180,8 +178,8 @@ An unrecognised 4xx is parked, never retried indefinitely. Every retry counts
 against the 80 per second operating point. Decision D12.
 
 *If wrong:* if the two systems have to agree at all times, the portal save has
-to validate against Salesforce's rules before it is accepted, which puts a
-Salesforce call on the user's save path.
+to validate against Salesforce's rules first, which puts a Salesforce call on
+the user's save path.
 
 ### 1.6 Shape of the service
 
@@ -218,6 +216,27 @@ Traffic crosses the boundary in two directions, both over HTTPS:
   catch-up poll. A record retrieve, for a Salesforce ID we hold no mapping for.
   A query against ContactHistory and AccountHistory, for the history of an
   outage window.
+
+```
+                  Salesforce (the client's, unchanged)
+                        |                  ^
+   signed POST to       |                  |   REST as the integration user:
+   /webhook/salesforce  |                  |   upsert PATCH, SOQL on
+                        v                  |   SystemModstamp, record
+            +-----------------------------------+  retrieve, history query
+            |   endpoint   |   sync worker      |   one deployable unit
+            +-----------------------------------+
+                        |                  ^
+                   write inbox        read inbox, outbox
+                        v                  |
+            +-----------------------------------+
+            |  Postgres: records, field values,  |
+            |  history, shadow, inbox, outbox    |
+            +-----------------------------------+
+                        ^                  |
+                        |                  v
+              the portal (finance and customer-success staff)
+```
 
 Salesforce never reads our database, and we never run code inside Salesforce.
 Four things have to change on the client's side before any of this works: field
@@ -290,8 +309,8 @@ for each one:
    one is retrieved from Salesforce, and its external ID either binds it to an
    existing portal record or shows it to be new (A11).
 3. Take the record's row lock, the same lock a portal save takes (A10).
-4. Apply the loop rule (section 9). An echo of our own write stops here, after
-   the binding in step 2 has been kept.
+4. Apply the loop rule (section 9), which drops the fields that match what we
+   sent and keeps the rest. The binding from step 2 is kept either way.
 5. For each changed field, apply the conflict rule (section 7), write
    `field_history`, update `field_value` when the change wins, and update
    `salesforce_shadow` either way, since the shadow is what Salesforce holds and
@@ -383,13 +402,17 @@ Decision D16.
 
 The brief says both happen.
 
-A duplicate is stopped at the endpoint. The deduplication key is the Salesforce
-record ID, `occurredAt`, and a hash of the changed fields, with a unique index
-on it. A second delivery of the same event finds the key present, stores
-nothing, and still answers 200, because an error would only invite another
-redelivery. Two genuinely separate edits in the same second with the same values
-produce the same key and collapse into one, which loses nothing: the value and
-the time are identical, and only one history row would differ, by actor.
+A duplicate is stopped at the endpoint. The key is `eventId` from the payload,
+with a unique index on it. A second delivery of the same `eventId` stores
+nothing and still answers 200, because an error would only invite another
+redelivery.
+
+An event arriving without an `eventId` falls back to a composite key of record
+ID, `occurredAt` and a hash of the changed fields. The fallback is weaker: two
+separate edits setting the same value in the same second collapse into one and
+an actor is lost, which the brief counts as losing a change. The share of events
+taking the fallback is counted, because it rising means the sender changed.
+Decision D21.
 
 Out-of-order delivery is handled by the same comparison that settles conflicts.
 Each field carries the event time of its current value, so a webhook arriving
@@ -406,22 +429,26 @@ not an error, and is resolved by retrieving the record (A11).
 Our write to Salesforce comes back to us as a webhook. Left alone, applying it
 would produce another write, and so on.
 
-Two checks, in this order:
+A record-triggered flow runs as the user who made the edit, so our write and any
+automation that write sets off both come back stamped with our integration user
+(claim C29). Identity cannot be the whole rule.
 
-1. **Identity.** If `changedBy` is our integration user, the event is our own
-   echo and stops here. It is cheap and it catches the normal case (A6).
-2. **Value.** If the incoming value already matches `salesforce_shadow` for that
-   field, Salesforce is telling us something we already know, and the event
-   stops here too.
+1. **Identity.** A `changedBy` equal to our integration user marks the event a
+   likely echo. Any other actor is a genuine Salesforce change and goes straight
+   to the conflict rule.
+2. **Field comparison.** In a likely echo, each changed field is compared
+   against the value we sent, held in `salesforce_shadow`. A field that matches
+   is our own echo and is dropped. A field that differs was changed by something
+   in the org after our write, a reformatted phone number or a status a flow
+   set, and is applied as a genuine change.
 
-Identity comes first because a Salesforce automation that fires after our write
-changes the record again under a different actor, and that change is genuine and
-must be applied. The value check catches what identity misses, including a
-webhook whose `changedBy` is missing or unexpected.
+Dropping the whole event on identity alone would lose exactly those automation
+results, and lose them silently, since no error is raised anywhere. Decision
+D20, which supersedes D5.
 
-One ordering rule matters: when an echo is for a record we have just created,
-the binding of the Salesforce ID to the portal UUID is kept before the event is
-dropped (A11). Decision D5.
+One ordering rule still holds: when the echo is for a record we have just
+created, the binding of the Salesforce ID to the portal UUID is kept before any
+field is dropped (A11).
 
 ## 10. The 6-hour outage: what is on disk, how it drains, and the arithmetic
 
@@ -437,7 +464,15 @@ hours. When calls start succeeding again, recovery runs in a fixed order:
 
 1. The catch-up query first, over the whole outage window, applying what
    Salesforce changed while we were blind.
-2. Then the outbound drain.
+2. Then the outbound drain, in two lanes.
+
+The lanes run over the same outbox table, split by whether the edit was made
+during the outage or after recovery began (D22). The live lane goes first, up to
+its 10 requests a second, so an edit made while both systems are up still meets
+the 30-second target in the middle of a recovery. The backlog lane takes
+whatever is left of the 80. With one queue in arrival order, a new edit would
+wait behind 108,000 rows for up to 26 minutes, and the oldest-row alarm would
+ring for the whole drain.
 
 ```
 6 hours                     = 21,600 seconds
@@ -476,20 +511,24 @@ records the query found (A4), which is the 243 calls above.
 
 | Number | Call someone when | Why this one |
 |---|---|---|
-| Age of the oldest pending outbox row | It passes 60 seconds while Salesforce is up | The target is 30 seconds, so 60 means the drain is losing ground to live traffic |
+| Age of the oldest pending row in the live lane | It passes 60 seconds while Salesforce is up | The target is 30 seconds, so 60 means live traffic is losing ground. The backlog lane is excluded, or a recovery that is working would ring the alarm |
 | Count of parked and failed items | It grows for 10 minutes without pause | Separates a bad deployment or a permission change from one awkward record |
 | Share of changes the poll finds with no webhook explaining them | It passes 1 per cent | The only number that detects silent loss; a rising share means webhook delivery is failing quietly |
 
-The too-close-to-call counter from section 7 is watched too, as the signal that
-the conflict rule needs replacing, though it is not an alert. Decision D18.
+Two more numbers are shown without being alarms: the backlog lane's expected
+drain time, so a recovery in progress is visible as progress, and the
+too-close-to-call counter from section 7, which is the signal that the conflict
+rule needs replacing. Decision D18.
 
 ## 12. What is left out of this weekend's work
 
 - Deletes on either side.
 - Any user interface.
 - A second region.
-- Code. This is a design document, and the brief puts a program out of scope
-  unless it calls a fake Salesforce written for the purpose.
+- Code. The brief makes a program optional and this submission is the design.
+  A program, if one were written, has to call a fake Salesforce written for the
+  purpose, and the brief names a duplicate, an older event after a newer one,
+  and a restart with the fake down as the cases to exercise.
 - The initial load of the 5 million records. The design assumes both sides
   already hold the same records. A backfill would compete for the same 100 calls
   a second and needs its own throttle below the live operating point, with the
@@ -535,3 +574,6 @@ quoting the documentation (P1).
 | C26 | A change becomes visible to a SystemModstamp query some short time after it commits | Assumption, lag undocumented, question Q12 |
 | C27 | `occurredAt` is the time the field changed, not the time the event was sent | Assumption, question Q19 |
 | C28 | Every Salesforce HTTP response carries a `Date` header | Verified, from the HTTP specification |
+| C29 | A record-triggered flow runs as the user who made the edit, and that user is recorded as the last modifier on the flow's own writes | Verified, Salesforce admin blog through a search result |
+| C30 | Which user an Apex trigger's changes are attributed to. One third-party source says the Automated Process user, against the common understanding that it stays the user who made the write | Not determined, question Q22 |
+| C31 | The webhook carries an `eventId`, one per event | From the brief's sample. Whether it survives a redelivery unchanged is question Q21 |

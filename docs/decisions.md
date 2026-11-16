@@ -232,7 +232,7 @@ edit, and the design needs a way to stay under the cap at peak without it.
 
 ## D5. The loop rule checks identity first, then compares values
 
-**Status:** agreed
+**Status:** superseded by D20
 
 **Raised by:** Abhishek asked whether the echo of our own update identifies our
 integration user. The AI argued that identity alone is insufficient.
@@ -968,6 +968,115 @@ a question for the client as Q10.
 operating point, and the catch-up watermark has to start after it finishes.
 
 
+---
+
+## D20. Identity marks an event as a likely echo; the field comparison decides
+
+**Status:** agreed, supersedes D5
+
+**Raised by:** Abhishek, reading section 9 of the design.
+
+**Problem:** D5 dropped an inbound event outright when `changedBy` was our
+integration user, on the reasoning that a Salesforce automation firing after our
+write would carry a different actor. That reasoning is wrong. A record-triggered
+flow runs as the user who made the edit, which for our write is our integration
+user, and the last modifier it stamps is that same user. So the identity check
+would drop exactly the automation change it claimed to protect, and the portal
+would never see a value Salesforce computed from our write.
+
+**Options, and why they lost:**
+
+- **Drop on identity alone.** Rejected: it silently loses every automation
+  result, and the loss is invisible because no error is raised.
+- **Drop the identity check and compare values only.** Rejected: identity is
+  cheap, and it is a correct signal for which comparison to run.
+
+**Decision:** An event whose `changedBy` is our integration user is marked a
+likely echo, not discarded. Each changed field in it is compared against the
+value we sent for that record, held in the shadow copy. Fields that match are
+dropped as our own echo. Fields that differ are applied as genuine Salesforce
+changes, because something in the org changed them after our write. An event
+from any other actor skips the echo comparison entirely.
+
+**Pushback:** Abhishek found the defect and gave the fix. The AI had written the
+original reasoning in D5 and had not checked how automation is attributed.
+
+**If wrong:** if automation turns out to run under a different user in this org
+after all, the identity check alone would have been sufficient, and this rule
+still produces the correct result at the cost of one comparison per field.
+
+---
+
+## D21. A duplicate webhook is detected by eventId, with the composite key as the fallback
+
+**Status:** agreed
+
+**Raised by:** Abhishek, reading section 8 of the design.
+
+**Problem:** Section 8 deduplicated on the record ID, `occurredAt` and a hash of
+the changed fields. The brief's sample webhook carries `eventId`, and the design
+ignored it. The composite key also collapses two genuinely separate edits that
+set the same value in the same second, which loses one actor and breaks the
+brief's requirement to know who changed what.
+
+**Options, and why they lost:**
+
+- **The composite key alone.** Rejected: it discards an actor, which the brief
+  counts as losing a change.
+- **No deduplication, relying on the apply being idempotent.** Rejected: the
+  second delivery would write a second history row with the same value, which
+  is the same loss of truth in the other direction.
+
+**Decision:** `eventId` is the deduplication key, with a unique index on it. A
+second delivery of the same `eventId` stores nothing and still answers 200. The
+composite key of record ID, `occurredAt` and changed-field hash stays as a
+fallback for an event that arrives without an `eventId`, and the count of events
+taking that fallback is monitored, because it means the sender changed.
+
+**Pushback:** Abhishek found that the brief's sample carries `eventId`, which the
+AI had missed when reading the payload.
+
+**If wrong:** if `eventId` is not unique per delivery attempt, for example if it
+is regenerated on a retry, deduplication falls back to the composite key and the
+lost-actor case returns.
+
+---
+
+## D22. The outbound drain runs two lanes, live first
+
+**Status:** agreed
+
+**Raised by:** Abhishek, reading the outage arithmetic in section 10.
+
+**Problem:** The drain arithmetic reserves 10 requests a second for live
+traffic, but nothing in a single first-in-first-out outbox makes live traffic go
+first. A portal edit made after recovery would queue behind 108,000 backlog
+rows and wait up to 26 minutes, with both systems up, which breaks the 30-second
+target. The oldest-pending-row alert would also fire for the whole drain, so the
+one alarm that matters would be ringing throughout a recovery that is working.
+
+**Options, and why they lost:**
+
+- **One queue, oldest first.** Rejected: it is the behaviour described above.
+- **One queue, newest first.** Rejected: the backlog would never drain while
+  live traffic continues.
+
+**Decision:** Two lanes over the same outbox table, separated by whether the
+edit was made during the outage or after recovery began. The live lane is served
+first, up to its 10 requests a second. The backlog lane gets whatever is left of
+the 80. The oldest-pending alert watches the live lane only. The backlog's
+expected drain time is reported as its own number, so a recovery in progress is
+visible without being an alarm.
+
+**Pushback:** Abhishek found both halves of this: the starvation and the false
+alarm. The AI had written the arithmetic correctly and had not said what enforces
+it.
+
+**If wrong:** if live traffic alone exceeds the operating point, the backlog
+lane gets nothing and the drain never finishes, so the backlog drain time has to
+be watched and the operating point raised toward the cap.
+
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
@@ -996,6 +1105,8 @@ assumption and the question we would have asked.
 | Q18 | Which Salesforce API version does the client's integration target? | The upsert in D11 answers 204 with no body on version 45.0 and earlier, and 200 with a body from 46.0 on. |
 | Q19 | Is `occurredAt` the time the field changed, or the time the event was sent? | D16 compares it against our server clock. A send time moves with retries and delivery delay. |
 | Q20 | Which side owns each of the nine fields, if we ever need to decide conflicts by ownership? | D16 keeps field ownership in reserve, to be used if the too-close-to-call counter climbs. |
+| Q21 | Does `eventId` stay the same across redeliveries of one event, or change on each attempt? | D21 makes it the deduplication key. A new value per attempt makes duplicates undetectable by it. |
+| Q22 | What automation runs in the org on Contact and Account, and under which user? | D20 applies the fields an automation changed after our write. Apex triggers and flows may be attributed differently. |
 
 ---
 
