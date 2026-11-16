@@ -696,6 +696,154 @@ Postgres, and a duplicate after a timeout becomes possible and has to be
 detected by a reconciliation query.
 
 
+---
+
+## D12. A permanent Salesforce rejection parks the edit and marks the record in the portal
+
+**Status:** agreed
+
+**Raised by:** Abhishek, asking what happens when Salesforce refuses a write for
+good and not because it is unreachable.
+
+**Problem:** A validation rule, a missing required field or a field the
+integration user cannot write fails the same way on every retry. Retrying it
+forever burns the rate budget and stalls the records behind it.
+
+**Options, and why they lost:**
+
+- **Roll the portal edit back to the last value Salesforce accepted.** Rejected:
+  it destroys a person's work over a machine's rule, and the person who typed
+  the value is the one able to fix it.
+- **Retry on a long schedule and leave it in the queue.** Rejected: a poisoned
+  record holds up everything behind it, worst during the outage drain.
+
+**Decision:** The edit leaves the outbound queue, is parked with the Salesforce
+error, and the record is marked in the portal as out of step with Salesforce.
+When the user corrects the value, the new edit merges into the parked item and
+retries it. It never queues behind it, or the record would never recover.
+Classification is by the error code in the response body, not the status alone:
+REQUEST_LIMIT_EXCEEDED arrives as a 403 and means slow down, so it backs off
+across the whole worker and keeps the edit queued. An unrecognised 4xx is
+parked, never retried indefinitely. Every retry counts against the 80 per second
+operating point.
+
+**Pushback:** Abhishek rejected the AI's open-ended retry framing and added the
+merge-into-the-parked-item rule and the body-code classification. The AI had
+proposed classifying on the status code alone, which would have treated a rate
+limit as permanent.
+
+**If wrong:** if the client expects the two systems to agree at all times,
+parking is unacceptable and the portal save has to validate against Salesforce's
+rules before it is accepted, which puts a Salesforce call on the user's save
+path.
+
+---
+
+## D13. Two portal users editing one field are separated by the field version the form loaded
+
+**Status:** agreed
+
+**Raised by:** The brief, which names concurrent portal edits as a case it does
+not settle.
+
+**Problem:** Two people open the same record, both change the same field, and
+the second save silently overwrites the first.
+
+**Options, and why they lost:**
+
+- **Last write wins.** Rejected: the first user never learns their change was
+  replaced.
+- **Lock the record while a form is open.** Rejected: a browser tab left open
+  over lunch would lock a record for an hour.
+
+**Decision:** The form carries the version of each field it loaded. A save whose
+version is behind the stored one is refused, and the user is shown who changed
+the field and what it now holds. Salesforce receives the winner only, so a
+refused save produces no outbound call.
+
+**Pushback:** The AI noted that the field version also moves when an inbound
+Salesforce webhook changes that field, so the message shown to the user has to
+be able to name a Salesforce user and not only a portal colleague. Abhishek's
+rule is unchanged by this; the message text has to cover both.
+
+**If wrong:** if refusing the save is judged too harsh for finance staff, the
+alternative is accepting it and showing the overwritten value with an undo,
+which keeps the same version column and changes the portal behaviour only.
+
+---
+
+## D14. The webhook is authenticated by an HMAC signature over the raw body
+
+**Status:** agreed
+
+**Raised by:** The brief, which requires the endpoint to check a message before
+storing anything and names no scheme.
+
+**Problem:** Without authentication, anyone who finds the endpoint can write to
+the client's customer records.
+
+**Options, and why they lost:**
+
+- **A bearer token in a header.** Rejected: it proves nothing about the body,
+  and a leaked token is replayable until someone rotates it.
+- **Mutual TLS.** Rejected: heavier to operate, on the assumption that the
+  client's Salesforce side can sign a payload more easily than it can manage a
+  client certificate.
+
+**Decision:** A shared secret, and a signature over the exact bytes received,
+computed before the body is parsed and compared in constant time. The signed
+material carries a timestamp, and a signature outside a short window is refused,
+so a captured request cannot be replayed later. A failed check is refused
+outright and nothing is stored, which is the one case D8 keeps out of the
+parking table. Two secrets are accepted during a rotation.
+
+**Pushback:** The AI added the raw-body rule, the timestamp window and the
+rotation path to Abhishek's scheme. Signing a re-serialised body breaks on any
+difference in key order or whitespace.
+
+**If wrong:** if the client's Salesforce side cannot sign a payload, the fallback
+is a long random secret in a header plus an allow-list of source addresses, which
+is weaker against replay and has to be stated as such.
+
+---
+
+## D15. One service, two processes, talking only through Postgres tables
+
+**Status:** agreed
+
+**Raised by:** Abhishek, settling the shape of the thing before the sections
+that describe it are written.
+
+**Problem:** The webhook endpoint has to answer in milliseconds. The sync worker
+makes calls that take hundreds of milliseconds and can be blocked for six hours.
+Running both in one loop makes the endpoint's response time depend on
+Salesforce.
+
+**Options, and why they lost:**
+
+- **One process doing both.** Rejected: a Salesforce outage would slow or stop
+  the endpoint that has to keep accepting webhooks.
+- **A queue product between them.** Rejected under the Postgres-first rule: the
+  volumes here are small enough for ordinary tables, and the inbox has to be
+  durable in Postgres anyway so a webhook survives a restart.
+
+**Decision:** Two processes in one deployable unit. The endpoint authenticates a
+webhook, writes it to an inbox table, and answers. The sync worker reads the
+inbox, applies changes, and drains an outbox table of portal edits. They share
+no memory and make no direct calls to each other. The worker claims rows with
+SELECT ... FOR UPDATE SKIP LOCKED, so a second instance can run for availability
+without double-sending. The worker is woken by a Postgres notification and falls
+back to a one-second poll, which holds the 30-second target with no new
+component.
+
+**Pushback:** The AI added the claim rule and the wake-up mechanism. Without SKIP
+LOCKED, a second worker instance either blocks on the first or sends the same
+edit twice.
+
+**If wrong:** if the two processes have to scale very differently, they split
+into separate deployable units with no change to the tables between them.
+
+
 # Open questions for the client
 
 Questions whose answers would change the design. Each one has a working
@@ -718,8 +866,10 @@ assumption and the question we would have asked.
 | Q12 | How long after a change commits does Salesforce make it visible to a SystemModstamp query? | The continuous poll in D9 overlaps its window to cover this lag. If the lag is longer than the overlap, changes are missed silently. |
 | Q13 | Does the client's Salesforce org limit query volume more tightly than the record API cap? | The poll in D9 costs about 2 calls a minute. A separate query limit would stretch the interval and with it the repair time for a lost webhook. |
 | Q14 | Who reviews webhooks that the endpoint cannot interpret, and how quickly? | D8 parks them in a table and counts them. A parked webhook is a change that has not been applied. |
-| Q15 | Can an external ID field, unique, be added to Contact and Account to hold our portal UUID? | D11 keys the outbound upsert on it. Without it a retried create can duplicate a record in Salesforce. |
+| Q15 | Can a custom field marked both External ID and Unique be added to Contact and Account to hold our portal UUID? The Unique attribute is what blocks duplicates, and External ID alone also forces the caller to hold View All Data. | D11 keys the outbound upsert on it. Without it a retried create can duplicate a record in Salesforce. |
 | Q16 | Can the webhook carry that external ID field alongside the Salesforce ID? | It would save a retrieve call on the first event for a record we created. The design works without it. |
+| Q17 | Can the client's Salesforce side compute an HMAC signature over the webhook body with a shared secret? | D14 assumes it can. The fallback is weaker against replay. |
+| Q18 | Which Salesforce API version does the client's integration target? | The upsert in D11 answers 204 with no body on version 45.0 and earlier, and 200 with a body from 46.0 on. |
 
 ---
 
