@@ -34,8 +34,11 @@ near-peak load held flat for six hours. Decision D7.
 Operating point: **80 requests per second** against the cap of 100, holding
 **20 per second** for retries and catch-up queries.
 
-*If wrong:* at a portal peak of 40/sec the drain rate halves and the 26 minutes
-in section 10 becomes about 54 minutes.
+*If wrong:* at a portal peak of 40/sec the drain keeps 80 - 40 = 40/sec, so the
+same backlog takes 108,000 / 40 = 2,700 seconds, about 45 minutes. If the
+busiest six hours rise with the peak, to 20/sec, the backlog is 20 x 21,600 =
+432,000 and the drain takes 432,000 / 40 = 10,800 seconds, 3 hours. Decision
+D27.
 
 **A2. The outage backlog uses the busiest sustained six hours, and the drain
 shares the cap with live traffic.** Peak covers the 30-second target; a six-hour
@@ -398,8 +401,8 @@ collisions per hour, any field        = 36,000 x 0.000012 = about 0.43
 collisions per hour, same field       = about 0.07 if edits spread evenly
 ```
 
-Roughly one collision on any field every two hours at peak, and well under one a
-day on the same field. Edits cluster on busy records, so the measured figure will
+Roughly one collision on any field every two hours at peak, and one or two a day
+on the same field if the peak never let up. Edits cluster on busy records, so the measured figure will
 run higher than the arithmetic, which is why it is counted. If it climbs, the
 fallback is field ownership: each field belongs to one side and that side wins
 whatever the clock says. That needs the client to assign the nine fields, so it
@@ -494,7 +497,8 @@ drain time = 108,000 / 70   = 1,543 seconds = about 26 minutes
 Salesforce records changed  = 15/sec x 21,600 = 324,000
 query calls at 2,000/page   = 324,000 / 2,000 = 162 calls
 history rows at 1.5/record  = 486,000 / 2,000 = 243 calls
-catch-up total              = about 405 calls = about 20 seconds
+catch-up total              = 162 + 243 = 405 calls
+at the 20/sec reserve       = 405 / 20 = about 20 seconds
 ```
 
 The live rate subtracted is the portal peak of 10/sec, because recovery at month
