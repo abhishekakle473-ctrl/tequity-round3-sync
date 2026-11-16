@@ -16,13 +16,14 @@ what. This document states the conclusion; the log holds the argument.
 ## 1. Assumptions, and the questions to ask before locking the design
 
 Every claim about Salesforce behaviour is marked **Verified** or **Assumption**.
-No Salesforce page could be opened directly, because `developer.salesforce.com`
-answered 403 Forbidden to every request, so verified claims come from search
-results quoting the documentation. Recorded as P1 in the decision log.
+The claims themselves are in the appendix, one line each. No Salesforce page
+could be opened directly, because `developer.salesforce.com` answered 403
+Forbidden to every request, so verified claims come from search results quoting
+the documentation. Recorded as P1 in the decision log.
 
-Each assumption gives its conclusion and one line on what changes if it is
-wrong. The options that lost, and who argued against what, are in the numbered
-decision it names.
+Each assumption below gives its conclusion and one line on what changes if it is
+wrong. The options that lost, the arithmetic and who argued against what are in
+the numbered decision it names.
 
 ### 1.1 Load
 
@@ -31,58 +32,23 @@ calls we make to Salesforce. The figures are conservative: a 6.67 per second
 portal peak against a 5 per second six-hour average is a ratio of 1.33,
 near-peak load held flat for six hours. Decision D7.
 
-Portal side, about 200 finance and customer-success users:
-
-| Measure | Rate | Source |
-|---|---|---|
-| Peak | 10/sec | 200 users x 2 saves a minute at month end = 6.67/sec, rounded up |
-| Busiest sustained 6 hours | 5/sec | Sizes an outage backlog |
-| Quiet hour | 0.5/sec | |
-
-Salesforce side, a larger sales team plus automation:
-
-| Measure | Rate | Source |
-|---|---|---|
-| Peak | 30/sec | Stated figure |
-| Busiest sustained 6 hours | 15/sec | The portal side's 2:1 peak-to-average ratio applied. Used only for query cost. |
+| Side | Peak | Busiest sustained 6 hours | Quiet hour |
+|---|---|---|---|
+| Portal, about 200 finance and customer-success users | 10/sec, from 200 users x 2 saves a minute at month end = 6.67/sec, rounded up | 5/sec, which sizes the outage backlog | 0.5/sec |
+| Salesforce, a larger sales team plus automation | 30/sec | 15/sec, the portal's 2:1 ratio applied, used only for query cost | |
 
 Operating point: **80 requests per second** against the cap of 100, holding
 **20 per second** for retries and catch-up queries.
 
 *If wrong:* at a portal peak of 40/sec the drain rate halves and the 26 minutes
-below becomes about 54 minutes.
+in section 10 becomes about 54 minutes.
 
 **A2. The outage backlog uses the busiest sustained six hours, and the drain
 shares the cap with live traffic.** Peak covers the 30-second visibility target;
 a six-hour backlog is a volume problem. The merge ratio is set to 1, making the
-result an upper bound. Decision D7.
-
-```
-6 hours                     = 21,600 seconds
-backlog  = 5/sec x 21,600   = 108,000 records
-drain rate = 80 - 10 live   = 70 requests/sec
-drain time = 108,000 / 70   = 1,543 seconds = about 26 minutes
-
-Salesforce records changed  = 15/sec x 21,600 = 324,000
-query calls at 2,000/page   = 324,000 / 2,000 = 162 calls
-history rows at 1.5/record  = 486,000 / 2,000 = 243 calls
-catch-up total              = about 405 calls = about 20 seconds
-```
-
-The live rate subtracted is the portal peak of 10/sec, because recovery at month
-end competes with month-end traffic. Three conditions hold the 26 minutes up,
-and each is a requirement on the recovery path in section 10:
-
-- Catch-up runs before the outbound drain. Otherwise about 7,000 records touched
-  on both sides fail their conditional update with a 412 and cost three calls
-  where one was budgeted, adding roughly 3.5 minutes.
-- Changes applied by catch-up never enter the outbound queue. Missing this turns
-  108,000 records into 432,000, which is 103 minutes.
-- The outbound worker runs calls concurrently. 70/sec at a 200ms round trip
-  means 14 requests in flight, 35 at 500ms; a sequential loop reaches about
-  5/sec and takes 6 hours.
-
-The 26 minutes is a floor measured with no throttling.
+result an upper bound, since pending edits to one record collapse into one call.
+A six-hour outage drains in about 26 minutes; the division is in section 10.
+Decision D7.
 
 *If wrong:* an outage covering a busier window enlarges the backlog in
 proportion.
@@ -92,62 +58,26 @@ proportion.
 **A3. Changes made during an outage are recovered by querying SystemModstamp**,
 since webhooks Salesforce tried to send during the outage may never arrive. The
 SOAP `getUpdated()` call and Change Data Capture replay were dropped. Decision
-D1.
+D1, claims C1 to C4.
 
-- **Verified:** SystemModstamp is read-only, always equal to or later than
-  LastModifiedDate, moves when automated processes touch a record, and is
-  indexed. LastModifiedDate can be back-dated during a migration and is not
-  indexed, so it is unsafe for ordering.
-- **Verified:** a query response returns at most 2,000 records, adjustable
-  between 200 and 2,000 with the `Sforce-Query-Options: batchSize` header, with
-  no guarantee the requested size is honoured.
-- **Assumption:** a SOQL filter on SystemModstamp has no lookback limit. No
-  documentation found either way; it is an ordinary indexed field filter.
-
-*If wrong:* a bounded query makes the outage window unrecoverable, and the
-design has to state a maximum tolerable outage.
+*If wrong:* if a SOQL filter on SystemModstamp has a lookback limit, the outage
+window is unrecoverable and the design has to state a maximum tolerable outage.
 
 **A4. Field history for the outage window comes from ContactHistory and
 AccountHistory, and tracking is switched on.** A catch-up query returns current
 values only, so a phone number changed three times during the outage comes back
-as one number, which the brief counts as losing a change. Decision D2.
-
-- **Verified:** ContactHistory is queryable with ContactId, Field, OldValue,
-  NewValue, CreatedById and CreatedDate. A record creation writes a row with
-  Field set to "created" and empty values. OldValue and NewValue cannot be
-  filtered on in SOQL; filtering is by record and date, which is what this needs.
-- **Verified:** standard tracking covers up to 20 fields per object, well above
-  the brief's field list, with retention up to 18 months and 24 through the API,
-  without Salesforce Shield. Long text, rich text, formula, roll-up summary and
-  auto-number fields cannot be tracked, and none of the brief's fields is one of
-  those.
-- **Assumption, the one that matters most:** tracking is switched on for these
-  fields in the client's org. It is off by default, per field.
-- **Assumption:** the brief's "customer" maps to the Salesforce Account object.
+as one number, which the brief counts as losing a change. Tracking is off by
+default, per field, so this is the assumption that matters most in the whole
+document. Decision D2, claims C5 to C10.
 
 *If wrong:* with tracking off, the outage window's intermediate values are
 unrecoverable by any API, and catch-up records one synthetic history entry per
 changed field against an unknown actor.
 
-**A5. A conditional update is available, and it is weak.** So 412 is an ordinary
-outcome meaning re-read and re-merge, and field-level version information is
-kept on our side. Decision D6.
-
-- **Verified:** the REST API supports `If-Unmodified-Since`. Salesforce's own
-  documentation calls it a weak validator comparing against the record's last
-  modified date, and the update proceeds only if nothing changed since. A failed
-  precondition on PATCH returns 412 Precondition Failed; a malformed header
-  value on PATCH or POST returns 400 Bad Request.
-- **Verified:** the strong validator, an ETag with `If-Match`, is returned for
-  Account records only, so it is unavailable for Contact.
-- **Assumption:** the header applies to Contact updates. The supported-resource
-  list names sObject Rows without the Account-only qualifier the ETag carries.
-- **Assumption, from the HTTP specification:** an HTTP-date value carries
-  one-second resolution, so two edits in the same second are indistinguishable
-  to this check.
-- **Not determined:** which timestamp field the comparison uses. Salesforce says
-  "last modified date", which suggests LastModifiedDate, while the field
-  recommended for change detection is SystemModstamp.
+**A5. A conditional update is available, and it is weak.** `If-Unmodified-Since`
+compares to the record's last modified date at one-second resolution, so 412 is
+an ordinary outcome meaning re-read and re-merge, and field-level version
+information is kept on our side. Decision D6, claims C11 to C16.
 
 *If wrong:* unsupported on Contact, every outbound write becomes a
 read-then-write with no server-side protection, needing a short row lock in
@@ -156,17 +86,7 @@ Postgres for the duration of the call.
 **A6. Our own write comes back identified as our integration user.** The loop
 rule checks identity first, then compares values, because a Salesforce
 automation firing after our write changes the record again under a different
-actor, and that change is genuine. Decision D5.
-
-- **Verified:** Salesforce attributes a change to the user whose credentials
-  made the API call, so a dedicated integration user makes our writes
-  distinguishable.
-- **Verified as common integration practice:** filtering inbound events on the
-  integration user's identity, and switching off outbound sending for that
-  user's profile so the echo is never emitted.
-- **Assumption:** the client's webhook populates `changedBy` from the record's
-  last modifier on every event. The webhook is a custom mechanism, so nothing
-  documents it; the brief's sample shows `changedBy` as an email address.
+actor, and that change is genuine. Decision D5, claims C17 to C19.
 
 *If wrong:* without a usable `changedBy`, every inbound event goes through value
 comparison; loop protection holds and inbound throughput suffers.
@@ -178,13 +98,8 @@ carries a `changedFields` object, the only evidence available. The inbound path
 normalises every payload into a list of field changes, each with field name, new
 value, time and actor, so the payload shape stops mattering downstream. A full
 record becomes that list by comparing against the shadow copy of last-seen
-Salesforce values. Decision D8.
-
-- A field **absent** from the payload means unchanged; **present with a null
-  value** means cleared.
-- A webhook the endpoint cannot interpret is parked in a table and counted, and
-  answered with a success response, because an error invites Salesforce to
-  redeliver a payload we can never read.
+Salesforce values. A field **absent** from the payload means unchanged; a field
+**present with a null value** means cleared. Decision D8.
 
 *If wrong:* with whole-record payloads the adapter absorbs the change, but the
 null rule breaks, since a field never sent becomes indistinguishable from one
@@ -193,31 +108,14 @@ deliberately cleared.
 **A8. The catch-up query runs every minute, all the time.** A changed-fields
 payload never re-asserts state, so one webhook lost to a network failure or a
 deployment leaves a record wrong until somebody edits that field again. The same
-query covers an ordinary lost webhook and a six-hour outage. Decision D9.
+query covers an ordinary lost webhook and a six-hour outage, at 2 calls a minute
+out of a 4,800-call budget, which is 0.04 per cent. Cost is the per-object
+floor, not the record volume, so polling more often is close to free; one minute
+is chosen for repair time. Decision D9.
 
-```
-Salesforce peak edit rate   = 30/sec = 1,800 records per minute
-one query page holds        = 2,000 records
-a 1-minute window needs     = 1 page per object type
-objects polled              = Contact and Account
-cost per poll               = 2 calls
-cost per minute             = 2 calls out of 4,800 = 0.04% of budget
-cost per day                = about 2,880 calls
-```
-
-Cost is the per-object floor, not the record volume, so polling more often is
-close to free; one minute is chosen for repair time. Field history is fetched
-only for records whose polled values differ from the shadow copy with no webhook
-explaining it, so steady-state history cost is near zero. The watermark lives in
-Postgres and advances only after the polled changes are applied, and each window
-overlaps the last and stops short of the present moment.
-
-**Assumption:** Salesforce makes a change visible to a SystemModstamp query some
-short time after it commits. No documentation states the lag, so the overlap is
-a guess and should be generous.
-
-Webhooks meet the 30-second target. The poll is the safety net: a lost webhook
-is repaired within about two poll intervals, so roughly two minutes.
+Salesforce makes a change visible to a SystemModstamp query some short time
+after it commits, and no documentation states the lag (claim C23), so each
+window overlaps the last generously and stops short of the present moment.
 
 *If wrong:* a visibility lag longer than the overlap loses changes silently,
 which is the worst failure mode here; the fix is a wider overlap at no extra
@@ -248,9 +146,6 @@ so both the time and the actor have to come from somewhere. Decision D10.
   locks them in a fixed order.
 - The lock covers the local transaction only, never a call to Salesforce.
 
-Ordering a portal edit against a Salesforce edit compares two clocks that were
-never synchronised. That belongs to the conflict rule in section 7.
-
 *If wrong:* without the lock, two saves to one record can commit in the opposite
 order to their timestamps, and the later save silently loses.
 
@@ -258,14 +153,8 @@ order to their timestamps, and the later save silently loses.
 an external ID field holding it.** The UUID is the primary key everywhere in our
 database and never changes; `salesforce_id` is a nullable column filled in when
 Salesforce answers. A replayed create matches the existing record instead of
-making a second one. Decision D11.
+making a second one. Decision D11, claims C20 to C22.
 
-- **Verified:** the REST API upserts on a custom external ID field, answering
-  201 when it created a record. A value matching more than one record answers
-  300 and writes nothing. A field marked External ID and Unique acts as a unique
-  index and blocks duplicates; without Unique, the caller needs View All Data.
-- **Assumption:** such a field can be added to Contact and Account in the
-  client's org. Questions Q15 and Q16.
 - An inbound event carrying a Salesforce ID we hold no mapping for is normal:
   every record created by a sales user arrives that way. The record is
   retrieved, and a populated external ID binds it to the portal UUID while an
@@ -311,35 +200,84 @@ Salesforce call on the user's save path.
 **A14. One service, two processes, talking only through Postgres tables.** The
 endpoint authenticates a webhook, writes it to an inbox table, and answers. The
 sync worker reads the inbox, applies changes, and drains an outbox table of
-portal edits. Decision D15.
-
-- The worker claims rows with `SELECT ... FOR UPDATE SKIP LOCKED`, so a second
-  instance can run for availability without double-sending.
-- The worker is woken by a Postgres notification and falls back to a one-second
-  poll, which holds the 30-second target with no new component.
+portal edits. The worker claims rows with `SELECT ... FOR UPDATE SKIP LOCKED`,
+so a second instance can run for availability without double-sending, and it is
+woken by a Postgres notification with a one-second poll behind it. Decision D15.
 
 *If wrong:* if the two processes have to scale very differently, they split into
 separate deployable units with no change to the tables between them.
 
 ### 1.7 Still open
 
-Silent in the brief, with no working assumption yet. Tracked in
-`docs/decisions.md` with the reason each one matters.
+- Whether the initial load of 5 million records is in scope. The design assumes
+  the two sides already hold the same records. Question Q10.
+- Whether `occurredAt` is the time the field changed or the time the event was
+  sent. Section 7 depends on it. Question Q19.
 
-- Whether the initial load of 5 million records is in scope.
-- Which clock decides order when a portal edit and a Salesforce edit collide.
-  That is the subject of section 7.
+## 2. The systems, who calls whom, and the interface on each side
 
-## Sections still to be written
+Salesforce is the client's and stays as it is. Our side is one service with two
+processes and one Postgres database (A14). The portal reads and writes that
+database directly and never calls Salesforce itself.
 
-2. The systems, who calls whom, the network boundary, and the interface on each side
-3. The subproblems, in the order to build them
-4. The data stored
-5. The inbound path, from webhook to our database
-6. The outbound path, from a portal edit to a Salesforce API call
-7. The rule when both sides change the same record
-8. The rule for a duplicate webhook, and for an older webhook arriving after a newer one
-9. The rule that stops a loop
-10. The 6-hour outage: what is on disk, how it drains, and the arithmetic
-11. Three numbers to watch, and the value at which to call someone
-12. What is left out of this weekend's work
+Traffic crosses the boundary in two directions, both over HTTPS:
+
+- Salesforce to us: an HTTP POST to one endpoint, `/webhook/salesforce`, signed
+  with a shared secret (A9). This is the only thing Salesforce sends us.
+- Us to Salesforce: REST calls as a dedicated integration user (A6). Four kinds,
+  and no others. A PATCH to the upsert resource keyed on the external ID field,
+  which is every write we make. A SOQL query on SystemModstamp, which is the
+  catch-up poll. A record retrieve, for a Salesforce ID we hold no mapping for.
+  A query against ContactHistory and AccountHistory, for the history of an
+  outage window.
+
+Salesforce never reads our database, and we never run code inside Salesforce.
+Four things have to change on the client's side before any of this works: field
+history tracking switched on for the nine fields, a custom field marked External
+ID and Unique added to Contact and Account, an integration user created with
+outbound webhook sending switched off for its profile, and the webhook
+configured to sign its payload.
+
+## 3. The subproblems, in the order to build them
+
+1. The field-level data model and the history table. Everything else is built on
+   them, and they are the hardest thing to change once records exist.
+2. The inbound apply, with deduplication and ordering.
+3. The outbox and the rate limiter.
+4. The loop rule.
+5. The catch-up poll and the outage path.
+6. Monitoring.
+
+Each step is useful on its own and testable against a fake Salesforce. Decision
+D17.
+
+## 4. The data stored
+
+Nine fields are in scope and no others: customer name, status and owner; contact
+full name, phone, email, city, owner, and the customer they belong to.
+
+The model is field-level, not record-level, because the brief requires edits to
+different fields of one record to both survive, and because SystemModstamp moves
+for the whole record and cannot tell us which field changed.
+
+| Table | What it holds |
+|---|---|
+| `record` | One row per customer or contact. Portal UUID as the primary key, `salesforce_id` nullable and unique, object type, and whether the record is out of step with Salesforce (A11, A13). |
+| `field_value` | The current value of one field of one record: value, version, the actor who set it, which side it came from, and the timestamp that won. Primary key is the record and the field name. |
+| `field_history` | Append-only. Every value a field has held, with the actor, the side, the event time, the time we recorded it, and whether it became current or was superseded. This is the brief's history requirement, and the losing side of a conflict goes here too. |
+| `salesforce_shadow` | The last value we saw in Salesforce for each field, with the record's last-seen SystemModstamp. Used to turn a whole-record payload into a list of changes, to detect our own echo, and to build a conditional update. |
+| `inbox` | One row per accepted webhook: the raw bytes, the parsed payload, the deduplication key with a unique index on it, and the state (pending, applied or parked). |
+| `outbox` | One row per pending Salesforce write: the record, the fields and values, the sequence number from the save, the attempt count, the next attempt time, and the last Salesforce error code. |
+| `sync_state` | Small single-row state the worker needs: the catch-up watermark per object type, the measured clock offset, and the time until which a rate-limit backoff holds. |
+
+A sequence supplies the order number taken under the row lock (A10). History is
+never updated or deleted, so a correction is a new row, which is what makes "the
+fact of an earlier edit stays on record" true in the database and not only in
+the design.
+
+Growth: 5 million records across 9 fields is 45 million `field_value` rows,
+which is ordinary for Postgres. `field_history` grows with edits, at roughly
+40/sec across both sides, so about 1.2 billion rows a year if the peak never
+stops. It is partitioned by month so old partitions can be detached, and nothing
+in the sync path queries it.
+
